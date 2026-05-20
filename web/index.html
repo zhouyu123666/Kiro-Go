@@ -73,6 +73,7 @@
 
         input[type="text"],
         input[type="password"],
+        input[type="number"],
         select,
         textarea {
             width: 100%;
@@ -929,6 +930,7 @@
                             </label>
                         </div>
                         <button class="btn btn-secondary btn-sm" onclick="showExportModal()" data-i18n="accounts.export"></button>
+                        <button class="btn btn-secondary btn-sm" onclick="refreshAllModels()" data-i18n="models.refreshAll"></button>
                         <button class="btn btn-primary btn-sm" onclick="showModal('add')" data-i18n="accounts.add"></button>
                     </div>
                 </div>
@@ -940,6 +942,7 @@
                         <button class="btn btn-sm btn-primary" onclick="batchAction('enable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.enable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('disable')" style="padding:3px 10px;font-size:12px" data-i18n="batch.disable"></button>
                         <button class="btn btn-sm btn-secondary" onclick="batchAction('refresh')" style="padding:3px 10px;font-size:12px" data-i18n="batch.refresh"></button>
+                        <button class="btn btn-sm btn-secondary" onclick="batchRefreshModels()" style="padding:3px 10px;font-size:12px" data-i18n="batch.refreshModels"></button>
                         <div style="height:16px;width:1px;background:#e2e8f0;flex-shrink:0"></div>
                     </div>
                     <div style="display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0">
@@ -1040,18 +1043,6 @@
                 <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword"></button>
             </div>
             <div class="card">
-                <div class="card-header"><span class="card-title">测试设置 / Test Settings</span></div>
-                <div class="form-group">
-                    <label>测试模型 / Test Model</label>
-                    <select id="testModelSelect" onchange="localStorage.setItem('kiro-test-model', this.value); testModel = this.value;">
-                        <option value="claude-opus-4.6">claude-opus-4.6</option>
-                        <option value="claude-opus-4.7">claude-opus-4.7</option>
-                        <option value="claude-sonnet-4.6">claude-sonnet-4.6</option>
-                        <option value="claude-sonnet-4">claude-sonnet-4</option>
-                        <option value="claude-haiku-4.5">claude-haiku-4.5</option>
-                        <option value="deepseek-3.2">deepseek-3.2</option>
-                    </select>
-                </div>
                 <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.proxyType"></label>
@@ -1078,6 +1069,44 @@
                     </div>
                 </div>
                 <button class="btn btn-primary" onclick="saveProxyConfig()" data-i18n="settings.saveProxy"></button>
+            </div>
+            <div class="card">
+                <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>
+                <div class="form-group">
+                    <label style="font-weight:600;margin-bottom:12px;display:block" data-i18n="settings.builtinFilters"></label>
+                    <div style="display:flex;flex-direction:column;gap:12px">
+                        <div>
+                            <label style="display:flex;align-items:center;gap:10px">
+                                <label class="switch"><input type="checkbox" id="filterClaudeCode"><span class="slider"></span></label>
+                                <span data-i18n="settings.filterClaudeCode"></span>
+                            </label>
+                            <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterClaudeCodeHint"></small>
+                        </div>
+                        <div>
+                            <label style="display:flex;align-items:center;gap:10px">
+                                <label class="switch"><input type="checkbox" id="filterEnvNoise"><span class="slider"></span></label>
+                                <span data-i18n="settings.filterEnvNoise"></span>
+                            </label>
+                            <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterEnvNoiseHint"></small>
+                        </div>
+                        <div>
+                            <label style="display:flex;align-items:center;gap:10px">
+                                <label class="switch"><input type="checkbox" id="filterStripBoundaries"><span class="slider"></span></label>
+                                <span data-i18n="settings.filterStripBoundaries"></span>
+                            </label>
+                            <small style="color:#64748b;font-size:12px;margin-top:4px;display:block;margin-left:54px" data-i18n="settings.filterStripBoundariesHint"></small>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group" style="margin-top:16px">
+                    <label style="font-weight:600;margin-bottom:8px;display:block" data-i18n="settings.customRules"></label>
+                    <div id="promptFilterRules" style="margin-bottom:8px"></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <button class="btn btn-sm btn-secondary" onclick="addPromptRule('regex')" data-i18n="promptFilter.addRegex"></button>
+                        <button class="btn btn-sm btn-secondary" onclick="addPromptRule('lines-containing')" data-i18n="promptFilter.addContains"></button>
+                    </div>
+                </div>
+                <button class="btn btn-primary" onclick="savePromptFilter()" data-i18n="settings.savePromptFilter"></button>
             </div>
             <div class="card">
                 <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
@@ -1225,6 +1254,17 @@
                 'settings.proxyHostRequired': '请填写代理地址和端口',
                 'settings.saveProxy': '保存代理设置',
                 'settings.proxySaved': '代理设置已保存',
+                'settings.promptFilter': 'System Prompt 过滤',
+                'settings.builtinFilters': '内置过滤器',
+                'settings.filterClaudeCode': '替换 Claude Code CLI 系统提示',
+                'settings.filterClaudeCodeHint': '检测到 Claude Code 内置系统提示时，替换为精简的后端提示词，避免泄露大量 CLI 指令到请求体。',
+                'settings.filterEnvNoise': '过滤环境噪音行',
+                'settings.filterEnvNoiseHint': '移除系统提示中注入的环境变量、Git 状态、最近提交等噪音内容。',
+                'settings.filterStripBoundaries': '移除边界标记',
+                'settings.filterStripBoundariesHint': '移除 --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- 等边界标记行。',
+                'settings.savePromptFilter': '保存过滤设置',
+                'settings.promptFilterSaved': '过滤设置已保存',
+                'settings.customRules': '自定义过滤规则',
                 'api.endpoints': 'API 端点',
                 'api.modelList': '模型列表',
                 'api.stats': '统计数据',
@@ -1253,6 +1293,7 @@
                 'detail.totalCredits': '总Credits',
                 'detail.models': '可用模型',
                 'detail.loadModels': '加载',
+                'detail.refreshModelCache': '刷新路由缓存',
                 'detail.loading': '加载中...',
                 'detail.noModels': '无可用模型',
                 'detail.loadFailed': '加载失败',
@@ -1338,6 +1379,9 @@
                 'common.saveFailed': '保存失败',
                 'common.logout': '退出登录',
                 'accounts.export': '导出',
+                'models.refreshAll': '刷新模型缓存',
+                'models.confirmRefreshAll': '确定为所有已启用账号刷新模型缓存？',
+                'models.refreshAllDone': '模型缓存刷新完成，共缓存 {0} 个模型',
                 'export.title': '导出账号',
                 'export.selectAll': '全选',
                 'export.deselectAll': '取消全选',
@@ -1360,12 +1404,15 @@
                 'batch.enable': '批量启用',
                 'batch.disable': '批量禁用',
                 'batch.refresh': '批量刷新',
+                'batch.refreshModels': '批量刷新模型',
                 'batch.selected': '已选 {0} 个',
                 'batch.selectAll': '全选',
                 'batch.confirmEnable': '确定批量启用 {0} 个账号？',
                 'batch.confirmDisable': '确定批量禁用 {0} 个账号？',
                 'batch.confirmRefresh': '确定批量刷新 {0} 个账号？',
                 'batch.refreshResult': '刷新完成：成功 {0}，失败 {1}',
+                'batch.confirmRefreshModels': '确定为已选 {0} 个账号刷新模型缓存？',
+                'batch.refreshModelsResult': '模型缓存刷新完成：成功 {0}，失败 {1}',
                 'batch.done': '操作完成',
                 'filter.search': '搜索邮箱/昵称...',
                 'filter.all': '全部',
@@ -1385,7 +1432,26 @@
                 'accounts.testing': '测试中...',
                 'accounts.testSuccess': '测试成功',
                 'accounts.testFailed': '测试失败',
-                'settings.testModel': '测试模型'
+                'accounts.selectModel': '选择测试模型',
+                'detail.save': '保存',
+                'detail.overageWeight': '超额调用权重',
+                'accounts.testLog.title': '测试日志',
+                'accounts.testLog.clear': '清空',
+                'accounts.testLog.hide': '隐藏',
+                'accounts.testLog.globalProxy': '全局代理',
+                'accounts.testLog.start': '开始测试 {0} | 模型: {1} | 代理: {2}',
+                'accounts.testLog.success': '✓ {0} 成功 ({1}s) 回复: {2}',
+                'accounts.testLog.failed': '✗ {0} 失败 ({1}s): {2}',
+                'accounts.testLog.error': '✗ {0} 异常: {1}',
+                'promptFilter.noRules': '暂无自定义规则',
+                'promptFilter.unnamed': '未命名',
+                'promptFilter.typeRegex': '正则替换',
+                'promptFilter.typeContains': '行级过滤',
+                'promptFilter.match': '匹配',
+                'promptFilter.replace': '替换为（留空则删除）',
+                'promptFilter.emptyRemove': '留空则删除匹配内容',
+                'promptFilter.addRegex': '+ 正则替换规则',
+                'promptFilter.addContains': '+ 行级过滤规则'
             },
             en: {
                 'login.subtitle': 'Enter admin password to login',
@@ -1473,6 +1539,17 @@
                 'settings.proxyHostRequired': 'Please enter proxy host and port',
                 'settings.saveProxy': 'Save Proxy Settings',
                 'settings.proxySaved': 'Proxy settings saved',
+                'settings.promptFilter': 'System Prompt Filter',
+                'settings.builtinFilters': 'Built-in Filters',
+                'settings.filterClaudeCode': 'Replace Claude Code CLI system prompts',
+                'settings.filterClaudeCodeHint': 'Detects Claude Code built-in system prompts and replaces them with a compact backend prompt.',
+                'settings.filterEnvNoise': 'Strip environment noise lines',
+                'settings.filterEnvNoiseHint': 'Removes injected env vars, git status, recent commits and similar noise from system prompts.',
+                'settings.filterStripBoundaries': 'Remove boundary markers',
+                'settings.filterStripBoundariesHint': 'Strips --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- marker lines.',
+                'settings.savePromptFilter': 'Save Filter Settings',
+                'settings.promptFilterSaved': 'Filter settings saved',
+                'settings.customRules': 'Custom Filter Rules',
                 'api.endpoints': 'API Endpoints',
                 'api.modelList': 'Model List',
                 'api.stats': 'Statistics',
@@ -1497,6 +1574,7 @@
                 'detail.totalCredits': 'Total Credits',
                 'detail.models': 'Available Models',
                 'detail.loadModels': 'Load',
+                'detail.refreshModelCache': 'Refresh Route Cache',
                 'detail.loading': 'Loading...',
                 'detail.noModels': 'No models available',
                 'detail.loadFailed': 'Load failed',
@@ -1582,6 +1660,9 @@
                 'common.saveFailed': 'Save failed',
                 'common.logout': 'Logout',
                 'accounts.export': 'Export',
+                'models.refreshAll': 'Refresh Model Cache',
+                'models.confirmRefreshAll': 'Refresh model cache for all enabled accounts?',
+                'models.refreshAllDone': 'Model cache refreshed, {0} models cached',
                 'export.title': 'Export Accounts',
                 'export.selectAll': 'Select All',
                 'export.deselectAll': 'Deselect All',
@@ -1604,12 +1685,15 @@
                 'batch.enable': 'Batch Enable',
                 'batch.disable': 'Batch Disable',
                 'batch.refresh': 'Batch Refresh',
+                'batch.refreshModels': 'Batch Refresh Models',
                 'batch.selected': '{0} selected',
                 'batch.selectAll': 'Select All',
                 'batch.confirmEnable': 'Enable {0} accounts?',
                 'batch.confirmDisable': 'Disable {0} accounts?',
                 'batch.confirmRefresh': 'Refresh {0} accounts?',
                 'batch.refreshResult': 'Refresh done: {0} success, {1} failed',
+                'batch.confirmRefreshModels': 'Refresh model cache for {0} selected accounts?',
+                'batch.refreshModelsResult': 'Model cache refresh done: {0} success, {1} failed',
                 'batch.done': 'Done',
                 'filter.search': 'Search email/nickname...',
                 'filter.all': 'All',
@@ -1629,7 +1713,26 @@
                 'accounts.testing': 'Testing...',
                 'accounts.testSuccess': 'Test OK',
                 'accounts.testFailed': 'Test Failed',
-                'settings.testModel': 'Test Model'
+                'accounts.selectModel': 'Select Test Model',
+                'detail.save': 'Save',
+                'detail.overageWeight': 'Overage Weight',
+                'accounts.testLog.title': 'Test Log',
+                'accounts.testLog.clear': 'Clear',
+                'accounts.testLog.hide': 'Hide',
+                'accounts.testLog.globalProxy': 'Global Proxy',
+                'accounts.testLog.start': 'Testing {0} | Model: {1} | Proxy: {2}',
+                'accounts.testLog.success': '✓ {0} OK ({1}s) Reply: {2}',
+                'accounts.testLog.failed': '✗ {0} Failed ({1}s): {2}',
+                'accounts.testLog.error': '✗ {0} Error: {1}',
+                'promptFilter.noRules': 'No custom rules yet',
+                'promptFilter.unnamed': 'Unnamed',
+                'promptFilter.typeRegex': 'Regex Replace',
+                'promptFilter.typeContains': 'Line Filter',
+                'promptFilter.match': 'Match',
+                'promptFilter.replace': 'Replace with (empty = remove)',
+                'promptFilter.emptyRemove': 'empty removes matched content',
+                'promptFilter.addRegex': '+ Regex Replace Rule',
+                'promptFilter.addContains': '+ Line Filter Rule'
             }
         };
         let currentLang = localStorage.getItem('kiro_lang') || 'zh';
@@ -1831,8 +1934,6 @@
                 selectedAccounts.clear();
             }
             renderAccounts();
-            setTimeout(function() { var sel = document.getElementById("testModelSelect"); if (sel) sel.value = testModel; }, 500);
-            
             updateBatchBar();
         }
         function toggleSelectAccount(id) {
@@ -1881,6 +1982,52 @@
                 alert(t('common.failed'));
             }
         }
+        async function batchRefreshModels() {
+            const ids = Array.from(selectedAccounts);
+            if (ids.length === 0) return;
+            if (!confirm(t('batch.confirmRefreshModels', ids.length))) return;
+            let success = 0, fail = 0;
+            for (const id of ids) {
+                try {
+                    const res = await fetch('/admin/api/accounts/' + id + '/models/refresh', {
+                        method: 'POST', headers: { 'X-Admin-Password': password }
+                    });
+                    const d = await res.json();
+                    if (d.success) success++; else fail++;
+                } catch { fail++; }
+            }
+            alert(t('batch.refreshModelsResult', success, fail));
+            selectedAccounts.clear();
+            updateBatchBar();
+            loadAccounts();
+        }
+        async function refreshAllModels() {
+            if (!confirm(t('models.confirmRefreshAll'))) return;
+            try {
+                const res = await fetch('/admin/api/accounts/models/refresh', {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                alert(t('models.refreshAllDone', d.refreshed || 0));
+            } catch (e) {
+                alert(t('common.failed'));
+            }
+        }
+        async function refreshAccountModels(id) {
+            try {
+                const res = await fetch('/admin/api/accounts/' + id + '/models/refresh', {
+                    method: 'POST', headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                if (d.success) {
+                    alert(t('detail.refreshModelCache') + ' OK (' + (d.count || 0) + ' models)');
+                } else {
+                    alert(t('common.failed') + ': ' + (d.error || ''));
+                }
+            } catch (e) {
+                alert(t('common.failed'));
+            }
+        }
         function renderAccounts() {
             const container = document.getElementById('accountsList');
             if (!container) return;
@@ -1920,8 +2067,7 @@
                     '<button class="btn btn-sm btn-icon btn-secondary" onclick="copyAccountJSON(\'' + a.id + '\', this)" title="' + t('accounts.copyJSON') + '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button>' +
                     (a.banStatus && a.banStatus !== 'ACTIVE' ? '' :
                         '<button class="btn btn-sm ' + (a.enabled ? 'btn-secondary' : 'btn-primary') + '" onclick="toggleAccount(\'' + a.id + '\',' + !a.enabled + ')">' + (a.enabled ? t('accounts.disable') : t('accounts.enable')) + '</button>') +
-                    '<button class="btn btn-sm btn-secondary" onclick="setAccountProxy(\'' + a.id + '\', \'' + (a.proxyURL || '').replace(/'/g, '') + '\')" style="background:#059669;color:#fff">' + (a.proxyURL ? '🌐' : '⚡') + ' 代理</button>' +
-                    '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff">' + '测试</button>' +
+                    '<button class="btn btn-sm btn-secondary" onclick="testAccount(\'' + a.id + '\')" id="test-' + a.id + '" style="background:#2563eb;color:#fff">' + t('accounts.test') + '</button>' +
                     '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.id + '\')">' + t('accounts.delete') + '</button>' +
                     '</div>' +
                     '</div>' +
@@ -2040,22 +2186,29 @@
                 '<div class="detail-section"><h4>' + t('detail.machineId') + '</h4><div class="machine-id-row">' +
                 '<input type="text" id="machineIdInput" value="' + (a.machineId || '') + '" placeholder="UUID">' +
                 '<button class="btn btn-sm btn-secondary" onclick="generateMachineId()">' + t('detail.generate') + '</button>' +
-                '<button class="btn btn-sm btn-primary" onclick="saveMachineId(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
+                '<button class="btn btn-sm btn-primary" onclick="saveMachineId(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div></div>' +
-                '<div class="detail-section"><h4>' + t('detail.weight') + '</h4><div class="machine-id-row">' +
-                '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" style="width:80px">' +
-                '<span style="color:#64748b;font-size:12px;flex:1">' + t('detail.weightHint') + '</span>' +
-                '<button class="btn btn-sm btn-primary" onclick="saveWeight(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
-                '</div></div>' +
-                '<div class="detail-section"><h4>' + t('detail.overage') + '</h4><div class="machine-id-row">' +
-                '<label style="display:flex;align-items:center;gap:8px;white-space:nowrap"><label class="switch" style="margin:0"><input type="checkbox" id="allowOverageInput" ' + (a.allowOverage ? 'checked' : '') + '><span class="slider"></span></label><span style="font-size:13px">' + t('detail.allowOverage') + '</span></label>' +
-                '<input type="number" id="overageWeightInput" value="' + (a.overageWeight || 1) + '" min="1" max="10" style="width:80px">' +
-                '<span style="color:#64748b;font-size:12px;flex:1">' + t('detail.overageHint') + '</span>' +
-                '<button class="btn btn-sm btn-primary" onclick="saveOverageSettings(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
-                '</div></div>' +
+                '<div class="detail-section"><h4>' + t('detail.weight') + '</h4>' +
+                '<div class="form-group" style="margin-bottom:8px">' +
+                '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10">' +
+                '<small style="color:#64748b;font-size:12px;margin-top:4px;display:block">' + t('detail.weightHint') + '</small>' +
+                '</div>' +
+                '<button class="btn btn-sm btn-primary" onclick="saveWeight(\'' + id + '\')">' + t('detail.save') + '</button>' +
+                '</div>' +
+                '<div class="detail-section"><h4>' + t('detail.overage') + '</h4>' +
+                '<div class="form-group">' +
+                '<label style="display:flex;align-items:center;gap:10px"><label class="switch" style="margin:0"><input type="checkbox" id="allowOverageInput" ' + (a.allowOverage ? 'checked' : '') + '><span class="slider"></span></label><span>' + t('detail.allowOverage') + '</span></label>' +
+                '</div>' +
+                '<div class="form-group" style="margin-bottom:8px">' +
+                '<label>' + t('detail.overageWeight') + '</label>' +
+                '<input type="number" id="overageWeightInput" value="' + (a.overageWeight || 1) + '" min="1" max="10">' +
+                '<small style="color:#64748b;font-size:12px;margin-top:4px;display:block">' + t('detail.overageHint') + '</small>' +
+                '</div>' +
+                '<button class="btn btn-sm btn-primary" onclick="saveOverageSettings(\'' + id + '\')">' + t('detail.save') + '</button>' +
+                '</div>' +
                 '<div class="detail-section"><h4>' + t('detail.proxyURL') + '</h4><div class="machine-id-row">' +
                 '<input type="text" id="proxyURLInput" value="' + (a.proxyURL || '') + '" placeholder="socks5://host:port" style="flex:1">' +
-                '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('common.saved').split(' ')[0] + '</button>' +
+                '<button class="btn btn-sm btn-primary" onclick="saveProxyURL(\'' + id + '\')">' + t('detail.save') + '</button>' +
                 '</div><p style="color:#64748b;font-size:12px;margin-top:4px">' + t('detail.proxyHint') + '</p></div>' +
                 '<div class="detail-section"><h4>' + t('detail.subscription') + '</h4><div class="detail-grid">' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.subscriptionType') + '</div><div class="detail-value">' + (a.subscriptionTitle || a.subscriptionType || '-') + '</div></div>' +
@@ -2072,7 +2225,7 @@
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalTokens') + '</div><div class="detail-value">' + formatNum(a.totalTokens || 0) + '</div></div>' +
                 '<div class="detail-item"><div class="detail-label">' + t('detail.totalCredits') + '</div><div class="detail-value">' + (a.totalCredits || 0).toFixed(2) + '</div></div>' +
                 '</div></div>' +
-                '<div class="detail-section"><h4>' + t('detail.models') + ' <button class="btn btn-sm btn-secondary" onclick="loadModels(\'' + id + '\')" style="margin-left:8px">' + t('detail.loadModels') + '</button></h4><div id="modelsList" class="model-list"></div></div>';
+                '<div class="detail-section"><h4>' + t('detail.models') + ' <button class="btn btn-sm btn-secondary" onclick="loadModels(\'' + id + '\')" style="margin-left:8px">' + t('detail.loadModels') + '</button> <button class="btn btn-sm btn-secondary" onclick="refreshAccountModels(\'' + id + '\')" style="margin-left:4px">' + t('detail.refreshModelCache') + '</button></h4><div id="modelsList" class="model-list"></div></div>';
             document.getElementById('detailModal').classList.add('active');
         }
         async function loadModels(id) {
@@ -2163,8 +2316,7 @@
                 if (d.success) { alert(t('detail.proxySaved')); loadAccounts(); } else { alert(t('detail.saveFailed') + ': ' + d.error); }
             } catch (e) { alert(t('detail.saveFailed')); }
         }
-        // 测试模型和日志
-        let testModel = localStorage.getItem('kiro-test-model') || 'claude-opus-4.6';
+        // 测试日志
         let testLogs = [];
         
         function getTestLogPanel() {
@@ -2173,7 +2325,7 @@
                 const container = document.createElement('div');
                 container.id = 'testLogPanel';
                 container.style.cssText = 'position:fixed;bottom:0;right:0;width:420px;max-height:300px;background:#1e293b;color:#e2e8f0;border-radius:8px 0 0 0;box-shadow:-2px -2px 10px rgba(0,0,0,0.3);z-index:9999;display:flex;flex-direction:column;font-size:12px;font-family:monospace;';
-                container.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#334155;border-radius:8px 0 0 0;"><span style="font-weight:600;">\ud83d\udccb \u6d4b\u8bd5\u65e5\u5fd7</span><div><button onclick="clearTestLog()" style="background:#ef4444;color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;margin-right:4px;font-size:11px;">\u6e05\u7a7a</button><button onclick="toggleTestLog()" style="background:#64748b;color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px;">\u9690\u85cf</button></div></div><div id="testLogContent" style="overflow-y:auto;padding:8px 12px;flex:1;max-height:250px;"></div>';
+                container.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#334155;border-radius:8px 0 0 0;"><span style="font-weight:600;">📋 ' + t('accounts.testLog.title') + '</span><div><button onclick="clearTestLog()" style="background:#ef4444;color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;margin-right:4px;font-size:11px;">' + t('accounts.testLog.clear') + '</button><button onclick="toggleTestLog()" style="background:#64748b;color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px;">' + t('accounts.testLog.hide') + '</button></div></div><div id="testLogContent" style="overflow-y:auto;padding:8px 12px;flex:1;max-height:250px;"></div>';
                 document.body.appendChild(container);
                 panel = container;
             }
@@ -2206,37 +2358,85 @@
         async function testAccount(id) {
             const btn = document.getElementById('test-' + id);
             if (!btn) return;
+            const ex = document.getElementById('testModelPopover');
+            if (ex) ex.remove();
+            let models = [];
+            try {
+                const res = await fetch('/admin/api/accounts/' + id + '/models/cached', {
+                    headers: { 'X-Admin-Password': password }
+                });
+                const d = await res.json();
+                models = Array.isArray(d.models) ? d.models : [];
+            } catch (e) { /* fallback to empty */ }
+
+            const rect = btn.getBoundingClientRect();
+            const top = Math.min(rect.bottom + 6, window.innerHeight - 160);
+            const left = Math.max(4, Math.min(rect.left, window.innerWidth - 280));
+            let inputHtml;
+            if (models.length > 0) {
+                models.sort();
+                inputHtml = '<select id="testModelChoice" style="width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;background:#fff">' +
+                    models.map(function(m) { return '<option value="' + m + '">' + m + '</option>'; }).join('') +
+                    '</select>';
+            } else {
+                inputHtml = '<input type="text" id="testModelChoice" placeholder="claude-sonnet-4" value="claude-sonnet-4" style="width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;box-sizing:border-box;">';
+            }
+            const popover = document.createElement('div');
+            popover.id = 'testModelPopover';
+            popover.style.cssText = 'position:fixed;inset:0;z-index:9998;';
+            popover.innerHTML =
+                '<div onclick="event.stopPropagation()" style="position:fixed;top:' + top + 'px;left:' + left + 'px;background:#fff;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.2);padding:16px;width:264px;">' +
+                '<div style="font-weight:600;font-size:13px;margin-bottom:10px;">' + t('accounts.selectModel') + '</div>' +
+                inputHtml +
+                '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">' +
+                '<button onclick="closeTestModelPopover()" style="padding:5px 14px;border:1px solid #e2e8f0;border-radius:5px;background:#fff;cursor:pointer;font-size:12px;">' + t('common.cancel') + '</button>' +
+                '<button onclick="confirmTestAccount(\'' + id + '\')" style="padding:5px 14px;border:none;border-radius:5px;background:#2563eb;color:#fff;cursor:pointer;font-size:12px;">' + t('accounts.test') + '</button>' +
+                '</div></div>';
+            popover.addEventListener('click', function(e) { if (e.target === popover) closeTestModelPopover(); });
+            document.body.appendChild(popover);
+        }
+        function closeTestModelPopover() {
+            const p = document.getElementById('testModelPopover');
+            if (p) p.remove();
+        }
+        async function confirmTestAccount(id) {
+            const choice = document.getElementById('testModelChoice');
+            const model = (choice ? choice.value.trim() : '') || 'claude-sonnet-4';
+            closeTestModelPopover();
+            await runTestAccount(id, model);
+        }
+        async function runTestAccount(id, model) {
+            const btn = document.getElementById('test-' + id);
+            if (!btn) return;
             const origText = btn.textContent;
-            btn.textContent = '...';
+            btn.textContent = t('accounts.testing');
             btn.disabled = true;
             btn.style.background = '#6b7280';
-            
             const acc = accountsData.find(a => a.id === id);
             const email = acc ? acc.email : id;
-            const proxy = acc ? (acc.proxyURL || '\u5168\u5c40\u4ee3\u7406') : '?';
-            
-            addTestLog('\u5f00\u59cb\u6d4b\u8bd5 ' + email + ' | \u4ee3\u7406: ' + proxy, 'info');
-            
+            const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+            addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
             try {
                 const startTime = Date.now();
                 const res = await fetch('/admin/api/accounts/' + id + '/test', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password }
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                    body: JSON.stringify({ model })
                 });
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 const d = await res.json();
                 if (d.success) {
-                    addTestLog('\u2713 ' + email + ' \u6210\u529f (' + elapsed + 's) status: ' + d.status, 'ok');
-                    btn.textContent = '\u2713';
+                    addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
+                    btn.textContent = '✓';
                     btn.style.background = '#059669';
                 } else {
-                    addTestLog('\u2717 ' + email + ' \u5931\u8d25 (' + elapsed + 's): ' + (d.error || 'unknown'), 'err');
-                    btn.textContent = '\u2717';
+                    addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || 'unknown'), 'err');
+                    btn.textContent = '✗';
                     btn.style.background = '#dc2626';
                 }
             } catch (e) {
-                addTestLog('\u2717 ' + email + ' \u5f02\u5e38: ' + e.message, 'err');
-                btn.textContent = '\u2717';
+                addTestLog(t('accounts.testLog.error', email, e.message), 'err');
+                btn.textContent = '✗';
                 btn.style.background = '#dc2626';
             }
             btn.disabled = false;
@@ -2277,6 +2477,7 @@
             loadThinkingConfig();
             loadEndpointConfig();
             loadProxyConfig();
+            loadPromptFilter();
         }
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
@@ -2353,6 +2554,60 @@
             const d = await res.json();
             if (d.success) { alert(t('settings.proxySaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
         }
+        var promptRules = [];
+        async function loadPromptFilter() {
+            const res = await fetch('/admin/api/prompt-filter', { headers: { 'X-Admin-Password': password } });
+            const d = await res.json();
+            document.getElementById('filterClaudeCode').checked = !!d.filterClaudeCode;
+            document.getElementById('filterEnvNoise').checked = !!d.filterEnvNoise;
+            document.getElementById('filterStripBoundaries').checked = !!d.filterStripBoundaries;
+            promptRules = d.rules || [];
+            renderPromptRules();
+        }
+        async function savePromptFilter() {
+            const res = await fetch('/admin/api/prompt-filter', {
+                method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
+                body: JSON.stringify({
+                    filterClaudeCode: document.getElementById('filterClaudeCode').checked,
+                    filterEnvNoise: document.getElementById('filterEnvNoise').checked,
+                    filterStripBoundaries: document.getElementById('filterStripBoundaries').checked,
+                    rules: promptRules
+                })
+            });
+            const d = await res.json();
+            if (d.success) { alert(t('settings.promptFilterSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }
+        }
+        function renderPromptRules() {
+            const container = document.getElementById('promptFilterRules');
+            if (!promptRules.length) { container.innerHTML = '<small style="color:#94a3b8">' + t('promptFilter.noRules') + '</small>'; return; }
+            container.innerHTML = promptRules.map((r, i) => {
+                const typeLabel = r.type === 'lines-containing' ? t('promptFilter.typeContains') : t('promptFilter.typeRegex');
+                const replacePlaceholder = r.type === 'lines-containing' ? '' : t('promptFilter.emptyRemove');
+                const replaceRow = r.type !== 'lines-containing'
+                    ? '<div style="margin-top:4px"><b>' + t('promptFilter.replace') + ':</b> <input value="' + (r.replace||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'replace\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace" placeholder="' + replacePlaceholder + '"></div>'
+                    : '';
+                return '<div style="border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;margin-bottom:6px;background:' + (r.enabled?'#f0fdf4':'#fef2f2') + '">' +
+                    '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
+                    '<label class="switch" style="transform:scale(0.8)"><input type="checkbox" ' + (r.enabled?'checked':'') + ' onchange="toggleRule(' + i + ')"><span class="slider"></span></label>' +
+                    '<input value="' + (r.name||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'name\',this.value)" style="font-size:13px;font-weight:600;border:none;border-bottom:1px dashed #cbd5e1;background:transparent;outline:none;flex:1" placeholder="' + t('promptFilter.unnamed') + '">' +
+                    '<span style="font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:3px;white-space:nowrap">' + typeLabel + '</span>' +
+                    '<button onclick="removeRule(' + i + ')" style="margin-left:4px;background:none;border:none;color:#ef4444;cursor:pointer;font-size:16px;line-height:1">&times;</button>' +
+                    '</div>' +
+                    '<div style="font-size:12px;color:#475569">' +
+                    '<div><b>' + t('promptFilter.match') + ':</b> <input value="' + (r.match||'').replace(/"/g,'&quot;') + '" onchange="updateRule(' + i + ',\'match\',this.value)" style="width:70%;padding:2px 6px;border:1px solid #d1d5db;border-radius:3px;font-size:12px;font-family:monospace"></div>' +
+                    replaceRow +
+                    '</div>' +
+                    '</div>';
+            }).join('');
+        }
+        function addPromptRule(type) {
+            const id = 'rule-' + Date.now();
+            promptRules.push({ id, name: '', type, match: '', replace: '', enabled: true });
+            renderPromptRules();
+        }
+        function removeRule(i) { promptRules.splice(i, 1); renderPromptRules(); }
+        function toggleRule(i) { promptRules[i].enabled = !promptRules[i].enabled; renderPromptRules(); }
+        function updateRule(i, field, value) { promptRules[i][field] = value; }
         function generateApiKey() {
             const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
             let key = 'sk-';
