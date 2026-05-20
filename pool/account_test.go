@@ -72,3 +72,59 @@ func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
 		t.Fatalf("expected account %q, got %q", account.ID, got.ID)
 	}
 }
+
+func TestGetNextForModelSkipsFreeOnOpusWhenModelListMissing(t *testing.T) {
+	p := &AccountPool{}
+	p.currentIndex = ^uint64(0) // ensure first probe starts at index 0
+	p.accounts = []config.Account{
+		{
+			ID:               "free-1",
+			SubscriptionType: "FREE",
+		},
+		{
+			ID:               "pro-1",
+			SubscriptionType: "PRO",
+		},
+	}
+
+	got := p.GetNextForModel("claude-opus-4.7")
+	if got == nil {
+		t.Fatalf("expected a PRO account for opus model")
+	}
+	if got.ID != "pro-1" {
+		t.Fatalf("expected pro-1, got %q", got.ID)
+	}
+}
+
+func TestGetNextForModelReturnsNilWhenOnlyFreeForOpus(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{
+		{
+			ID:               "free-1",
+			SubscriptionType: "FREE",
+		},
+	}
+
+	got := p.GetNextForModel("claude-opus-4.7")
+	if got != nil {
+		t.Fatalf("expected nil when only FREE account exists for opus, got %q", got.ID)
+	}
+}
+
+func TestGetNextForModelAllowsFreeForSonnetWhenModelListMissing(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{
+		{
+			ID:               "free-1",
+			SubscriptionType: "FREE",
+		},
+	}
+
+	got := p.GetNextForModel("claude-sonnet-4.6")
+	if got == nil {
+		t.Fatalf("expected FREE account for non-opus model")
+	}
+	if got.ID != "free-1" {
+		t.Fatalf("expected free-1, got %q", got.ID)
+	}
+}
