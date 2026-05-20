@@ -24,7 +24,7 @@
 ### Docker Compose（推荐）
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 mkdir -p data
 docker-compose up -d
@@ -45,7 +45,7 @@ docker run -d \
 ### 源码编译
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
@@ -83,10 +83,10 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## 环境变量
 
-| 变量 | 说明 | 默认值 |
-|-----|------|-------|
-| `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
-| `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| 变量             | 说明                         | 默认值             |
+| ---------------- | ---------------------------- | ------------------ |
+| `CONFIG_PATH`    | 配置文件路径                 | `data/config.json` |
+| `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | -                  |
 
 ## 参与贡献
 

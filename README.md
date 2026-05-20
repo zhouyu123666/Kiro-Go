@@ -24,7 +24,7 @@ If this project helps you, a Star would mean a lot.
 ### Docker Compose (Recommended)
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 mkdir -p data
 docker-compose up -d
@@ -45,7 +45,7 @@ docker run -d \
 ### Build from Source
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
