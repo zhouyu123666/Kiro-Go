@@ -39,7 +39,7 @@ docker run -d \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/quorinex/kiro-go:latest
+  ghcr.io/zhouyu123666/kiro-go:latest
 ```
 
 ### Build from Source
@@ -91,10 +91,6 @@ The setting takes effect immediately without restarting.
 ## Contributing
 
 Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
-
-## Friend Links
-
-- [LINUX DO](https://linux.do)
 
 ## Disclaimer
 

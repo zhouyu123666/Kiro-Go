@@ -39,7 +39,7 @@ docker run -d \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/quorinex/kiro-go:latest
+  ghcr.io/zhouyu123666/kiro-go:latest
 ```
 
 ### 源码编译
@@ -91,10 +91,6 @@ curl http://localhost:8080/v1/chat/completions \
 ## 参与贡献
 
 欢迎友好交流。遇到问题时，建议先让 Claude Code、Codex 等工具帮忙排查一下，大部分问题都能自己解决。如果能直接提个 PR 就更好了。
-
-## 友情链接
-
-- [LINUX DO](https://linux.do)
 
 ## 免责声明
 
