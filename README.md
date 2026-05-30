@@ -24,7 +24,7 @@ If this project helps you, a Star would mean a lot.
 ### Docker Compose (Recommended)
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 mkdir -p data
 docker-compose up -d
@@ -45,7 +45,7 @@ docker run -d \
 ### Build from Source
 
 ```bash
-git clone https://github.com/Quorinex/Kiro-Go.git
+git clone https://github.com/zhouyu123666/Kiro-Go.git
 cd Kiro-Go
 go build -o kiro-go .
 ./kiro-go
@@ -108,18 +108,14 @@ The setting takes effect immediately without restarting.
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `CONFIG_PATH` | Config file path | `data/config.json` |
-| `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| Variable         | Description                             | Default            |
+| ---------------- | --------------------------------------- | ------------------ |
+| `CONFIG_PATH`    | Config file path                        | `data/config.json` |
+| `ADMIN_PASSWORD` | Admin panel password (overrides config) | -                  |
 
 ## Contributing
 
 Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
-
-## Friend Links
-
-- [LINUX DO](https://linux.do)
 
 ## Disclaimer
 
