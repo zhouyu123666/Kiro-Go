@@ -81,6 +81,115 @@ func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
 	}
 }
 
+func TestNormalizeSubscriptionTier(t *testing.T) {
+	tests := []struct {
+		name  string
+		typ   string
+		title string
+		want  string
+	}{
+		{name: "prefer explicit type", typ: "pro_plus", title: "free plan", want: "PRO_PLUS"},
+		{name: "infer pro from title", typ: "", title: "Kiro Pro Monthly", want: "PRO"},
+		{name: "infer free from title", typ: "", title: "free tier", want: "FREE"},
+		{name: "unknown title", typ: "", title: "starter", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSubscriptionTier(tt.typ, tt.title); got != tt.want {
+				t.Fatalf("normalizeSubscriptionTier(%q, %q) = %q, want %q", tt.typ, tt.title, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSubscriptionLikelySupportsModel(t *testing.T) {
+	tests := []struct {
+		name  string
+		typ   string
+		title string
+		model string
+		want  bool
+	}{
+		{
+			name:  "non opus model always allowed",
+			typ:   "FREE",
+			title: "Free",
+			model: "claude-sonnet-4.5",
+			want:  true,
+		},
+		{
+			name:  "opus model requires pro-like tier",
+			typ:   "FREE",
+			title: "Free",
+			model: "claude-opus-4.1",
+			want:  false,
+		},
+		{
+			name:  "opus model allowed on pro tier",
+			typ:   "PRO",
+			title: "Kiro Pro",
+			model: "claude-opus-4.1",
+			want:  true,
+		},
+		{
+			name:  "unknown tier is optimistic",
+			typ:   "",
+			title: "",
+			model: "claude-opus-4.1",
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := subscriptionLikelySupportsModel(tt.typ, tt.title, tt.model); got != tt.want {
+				t.Fatalf("subscriptionLikelySupportsModel(%q, %q, %q) = %v, want %v", tt.typ, tt.title, tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAccountSupportsModelPrefersExplicitModelList(t *testing.T) {
+	p := newTestPool()
+	acc := &config.Account{
+		ID:                "acct-1",
+		SubscriptionType:  "PRO",
+		SubscriptionTitle: "Kiro Pro",
+	}
+
+	// Even with PRO subscription, explicit model list should be authoritative.
+	p.SetModelList("acct-1", []string{"claude-sonnet-4.5"})
+
+	if p.accountSupportsModel(acc, "claude-opus-4.1") {
+		t.Fatal("expected opus model to be rejected when not in explicit model list")
+	}
+	if !p.accountSupportsModel(acc, "claude-sonnet-4.5") {
+		t.Fatal("expected listed model to be accepted")
+	}
+}
+
+func TestAccountSupportsModelFallsBackToSubscriptionTier(t *testing.T) {
+	p := newTestPool()
+	free := &config.Account{
+		ID:                "free-acct",
+		SubscriptionType:  "FREE",
+		SubscriptionTitle: "Free",
+	}
+	pro := &config.Account{
+		ID:                "pro-acct",
+		SubscriptionType:  "PRO",
+		SubscriptionTitle: "Kiro Pro",
+	}
+
+	if p.accountSupportsModel(free, "claude-opus-4.1") {
+		t.Fatal("expected FREE account to reject opus model when model list is absent")
+	}
+	if !p.accountSupportsModel(pro, "claude-opus-4.1") {
+		t.Fatal("expected PRO account to allow opus model when model list is absent")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // IsAuthFailure
 // ---------------------------------------------------------------------------

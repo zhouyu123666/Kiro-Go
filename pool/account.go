@@ -168,14 +168,61 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 	return ids
 }
 
-// accountHasModel 检查账号是否支持指定模型。
-// 若该账号尚无模型列表（冷启动），视为支持所有模型。
-func (p *AccountPool) accountHasModel(accountID, model string) bool {
-	list, ok := p.modelLists[accountID]
-	if !ok || len(list) == 0 {
-		return true // 冷启动：列表未就绪，乐观放行
+func normalizeSubscriptionTier(subscriptionType, subscriptionTitle string) string {
+	tier := strings.ToUpper(strings.TrimSpace(subscriptionType))
+	if tier != "" {
+		return tier
 	}
-	return list[strings.ToLower(strings.TrimSpace(model))]
+
+	title := strings.ToUpper(strings.TrimSpace(subscriptionTitle))
+	switch {
+	case strings.Contains(title, "PRO"):
+		return "PRO"
+	case strings.Contains(title, "FREE"):
+		return "FREE"
+	default:
+		return ""
+	}
+}
+
+func modelRequiresProTier(model string) bool {
+	lowerModel := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(lowerModel, "opus")
+}
+
+func subscriptionLikelySupportsModel(subscriptionType, subscriptionTitle, model string) bool {
+	if !modelRequiresProTier(model) {
+		return true
+	}
+
+	tier := normalizeSubscriptionTier(subscriptionType, subscriptionTitle)
+	if tier == "" {
+		// Unknown tier: keep optimistic to avoid false negatives.
+		return true
+	}
+
+	switch tier {
+	case "PRO", "PRO_PLUS", "POWER", "TEAM", "ENTERPRISE":
+		return true
+	default:
+		return false
+	}
+}
+
+// accountSupportsModel checks if account can serve the model.
+// Priority:
+// 1) Explicit model list from ListAvailableModels.
+// 2) Subscription-tier fallback when model list is unavailable.
+func (p *AccountPool) accountSupportsModel(acc *config.Account, model string) bool {
+	if acc == nil {
+		return false
+	}
+
+	list, ok := p.modelLists[acc.ID]
+	if ok && len(list) > 0 {
+		return list[strings.ToLower(strings.TrimSpace(model))]
+	}
+	return subscriptionLikelySupportsModel(acc.SubscriptionType, acc.SubscriptionTitle, model)
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。
@@ -210,7 +257,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		if seen[acc.ID] {
 			continue
 		}
-		if !p.accountHasModel(acc.ID, model) {
+		if !p.accountSupportsModel(acc, model) {
 			seen[acc.ID] = true
 			continue
 		}
@@ -237,7 +284,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
-		if !p.accountHasModel(acc.ID, model) {
+		if !p.accountSupportsModel(acc, model) {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
