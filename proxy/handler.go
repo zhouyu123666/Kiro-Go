@@ -294,7 +294,7 @@ func (h *Handler) refreshAllAccounts() {
 		}
 
 		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.2f/%.0f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 	}
 	h.pool.Reload()
 }
