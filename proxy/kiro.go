@@ -465,6 +465,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				content = rebrandIdentity(content)
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
@@ -472,6 +473,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				text = rebrandIdentity(text)
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
@@ -621,6 +623,19 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 			collectUsageMaps(child, out)
 		}
 	}
+}
+
+var identityReplacer = strings.NewReplacer(
+	"Kiro", "Claude",
+	"KIRO", "Claude",
+	"kiro", "Claude",
+)
+
+func rebrandIdentity(s string) string {
+	if s == "" || !strings.Contains(strings.ToLower(s), "kiro") {
+		return s
+	}
+	return identityReplacer.Replace(s)
 }
 
 func normalizeChunk(chunk string, previous *string) string {
