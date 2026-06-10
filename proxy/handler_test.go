@@ -25,6 +25,77 @@ func TestThinkingSourceReasoningFirst(t *testing.T) {
 	}
 }
 
+func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
+	mustInitConfig(t)
+	now := time.Now().Unix()
+	if err := config.AddAccount(config.Account{
+		ID:                "acct-1",
+		Email:             "user@example.com",
+		UserId:            "user-1",
+		Nickname:          "primary",
+		AccessToken:       "secret-access-token",
+		RefreshToken:      "secret-refresh-token",
+		Enabled:           true,
+		SubscriptionType:  "PRO",
+		SubscriptionTitle: "Pro",
+		UsageCurrent:      25,
+		UsageLimit:        100,
+		UsagePercent:      0.99,
+		NextResetDate:     "2026-07-01",
+		LastRefresh:       now,
+		TrialUsageCurrent: 5,
+		TrialUsageLimit:   50,
+		TrialUsagePercent: 0.9,
+		TrialStatus:       "ACTIVE",
+		TrialExpiresAt:    now + 3600,
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/accounts/usage", nil)
+	req.Header.Set("X-Admin-Password", config.GetPassword())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var raw struct {
+		Accounts []map[string]interface{} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	if len(raw.Accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(raw.Accounts))
+	}
+	if _, ok := raw.Accounts[0]["accessToken"]; ok {
+		t.Fatalf("usage summary must not expose accessToken")
+	}
+	if _, ok := raw.Accounts[0]["refreshToken"]; ok {
+		t.Fatalf("usage summary must not expose refreshToken")
+	}
+
+	var got struct {
+		Accounts []accountUsageView `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode typed response: %v", err)
+	}
+	item := got.Accounts[0]
+	if item.ID != "acct-1" || item.Email != "user@example.com" || !item.Enabled {
+		t.Fatalf("unexpected account identity: %#v", item)
+	}
+	if item.UsageCurrent != 25 || item.UsageLimit != 100 || item.UsagePercent != 0.25 || item.UsagePercentage != 25 {
+		t.Fatalf("unexpected main usage fields: %#v", item)
+	}
+	if item.TrialUsageCurrent != 5 || item.TrialUsageLimit != 50 || item.TrialUsagePercent != 0.1 || item.TrialUsagePercentage != 10 {
+		t.Fatalf("unexpected trial usage fields: %#v", item)
+	}
+}
+
 func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
