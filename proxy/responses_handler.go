@@ -147,7 +147,6 @@ func (h *Handler) handleResponsesNonStream(
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -160,9 +159,6 @@ func (h *Handler) handleResponsesNonStream(
 			OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -178,9 +174,7 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
+		if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
@@ -332,13 +326,12 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText      strings.Builder
+			reasoningText strings.Builder
+			toolUses      []KiroToolUse
+			inputTokens   int
+			outputTokens  int
+			credits       float64
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -462,9 +455,6 @@ func (h *Handler) handleResponsesStream(
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -523,9 +513,7 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
+		if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
