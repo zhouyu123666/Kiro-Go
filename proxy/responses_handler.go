@@ -130,9 +130,10 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	affinityKey := routeAffinityKey(payload, apiKeyID)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithAffinity(model, affinityKey, excluded)
 		if account == nil {
 			break
 		}
@@ -181,6 +182,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordAffinitySuccess(affinityKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
@@ -306,10 +308,11 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	affinityKey := routeAffinityKey(payload, apiKeyID)
 	responseStarted := false
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.GetNextForModelWithAffinity(model, affinityKey, excluded)
 		if account == nil {
 			break
 		}
@@ -520,6 +523,7 @@ func (h *Handler) handleResponsesStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordAffinitySuccess(affinityKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)

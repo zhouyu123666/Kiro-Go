@@ -21,12 +21,20 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	affinity      map[string]affinityEntry   // routing key → last successful account
+}
+
+type affinityEntry struct {
+	AccountID string
+	UpdatedAt time.Time
 }
 
 var (
 	pool     *AccountPool
 	poolOnce sync.Once
 )
+
+const affinityTTL = 6 * time.Hour
 
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
@@ -35,6 +43,7 @@ func GetPool() *AccountPool {
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
 			modelLists:  make(map[string]map[string]bool),
+			affinity:    make(map[string]affinityEntry),
 		}
 		pool.Reload()
 	})
@@ -118,7 +127,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -232,6 +241,39 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
+// GetNextForModelWithAffinity returns the last successful account for the
+// affinity key when it is still routable; otherwise it falls back to weighted
+// round-robin selection.
+func (p *AccountPool) GetNextForModelWithAffinity(model, affinityKey string, excluded map[string]bool) *config.Account {
+	affinityKey = strings.TrimSpace(affinityKey)
+	if affinityKey == "" {
+		return p.GetNextForModelExcluding(model, excluded)
+	}
+
+	p.mu.RLock()
+	if len(p.accounts) == 0 {
+		p.mu.RUnlock()
+		return nil
+	}
+
+	allowOverUsage := config.GetAllowOverUsage()
+	now := time.Now()
+	if entry, ok := p.affinity[affinityKey]; ok {
+		if now.Sub(entry.UpdatedAt) <= affinityTTL {
+			for i := range p.accounts {
+				acc := &p.accounts[i]
+				if acc.ID == entry.AccountID && p.accountRoutableLocked(acc, model, excluded, allowOverUsage, now) {
+					p.mu.RUnlock()
+					return acc
+				}
+			}
+		}
+	}
+	p.mu.RUnlock()
+
+	return p.GetNextForModelExcluding(model, excluded)
+}
+
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
@@ -302,6 +344,28 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	return best
 }
 
+func (p *AccountPool) accountRoutableLocked(acc *config.Account, model string, excluded map[string]bool, allowOverUsage bool, now time.Time) bool {
+	if acc == nil {
+		return false
+	}
+	if excluded != nil && excluded[acc.ID] {
+		return false
+	}
+	if !p.accountSupportsModel(acc, model) {
+		return false
+	}
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+		return false
+	}
+	if isQuotaBlocked(*acc, allowOverUsage) {
+		return false
+	}
+	return true
+}
+
 // GetByID 根据 ID 获取账号
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
@@ -320,6 +384,36 @@ func (p *AccountPool) RecordSuccess(id string) {
 	defer p.mu.Unlock()
 	delete(p.cooldowns, id)
 	p.errorCounts[id] = 0
+}
+
+// RecordAffinitySuccess binds a routing key to the account that successfully
+// served it. The binding is in-memory and expires automatically.
+func (p *AccountPool) RecordAffinitySuccess(affinityKey, accountID string) {
+	affinityKey = strings.TrimSpace(affinityKey)
+	accountID = strings.TrimSpace(accountID)
+	if affinityKey == "" || accountID == "" {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.affinity == nil {
+		p.affinity = make(map[string]affinityEntry)
+	}
+	now := time.Now()
+	p.pruneAffinityLocked(now)
+	p.affinity[affinityKey] = affinityEntry{
+		AccountID: accountID,
+		UpdatedAt: now,
+	}
+}
+
+func (p *AccountPool) pruneAffinityLocked(now time.Time) {
+	for key, entry := range p.affinity {
+		if now.Sub(entry.UpdatedAt) > affinityTTL {
+			delete(p.affinity, key)
+		}
+	}
 }
 
 // RecordError 记录请求错误，设置冷却

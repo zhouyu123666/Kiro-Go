@@ -193,6 +193,7 @@ type KiroToolResult struct {
 	ToolUseID string              `json:"toolUseId"`
 	Content   []KiroResultContent `json:"content"`
 	Status    string              `json:"status"`
+	HasImages bool                `json:"-"`
 }
 
 type KiroResultContent struct {

@@ -384,6 +384,50 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 	}
 }
 
+func TestGetNextForModelWithAffinityPrefersLastSuccessfulAccount(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
+	p.currentIndex = 0 // round-robin would choose b first
+	p.RecordAffinitySuccess("session-1", "a")
+
+	acc := p.GetNextForModelWithAffinity("claude-sonnet-4.5", "session-1", nil)
+	if acc == nil || acc.ID != "a" {
+		t.Fatalf("expected sticky account a, got %#v", acc)
+	}
+}
+
+func TestGetNextForModelWithAffinityFallsBackWhenStickyAccountExcluded(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
+	p.currentIndex = ^uint64(0)
+	p.RecordAffinitySuccess("session-1", "a")
+
+	acc := p.GetNextForModelWithAffinity("claude-sonnet-4.5", "session-1", map[string]bool{"a": true})
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback account b, got %#v", acc)
+	}
+}
+
+func TestGetNextForModelWithAffinityFallsBackWhenStickyAccountLacksModel(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
+	p.SetModelList("a", []string{"claude-haiku-4.5"})
+	p.SetModelList("b", []string{"claude-sonnet-4.5"})
+	p.currentIndex = ^uint64(0)
+	p.RecordAffinitySuccess("session-1", "a")
+
+	acc := p.GetNextForModelWithAffinity("claude-sonnet-4.5", "session-1", nil)
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback account b, got %#v", acc)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Reload over-usage filtering
 // ---------------------------------------------------------------------------

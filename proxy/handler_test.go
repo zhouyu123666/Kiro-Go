@@ -229,6 +229,25 @@ func TestOpenAINonStreamIgnoresContextUsageForPromptTokens(t *testing.T) {
 	}
 }
 
+func TestRouteAffinityKeyUsesConversationAndAPIKey(t *testing.T) {
+	payload := &KiroPayload{}
+	payload.ConversationState.ConversationID = "conversation-1"
+
+	keyA := routeAffinityKey(payload, "api-key-a")
+	keyB := routeAffinityKey(payload, "api-key-b")
+
+	if keyA == "" {
+		t.Fatalf("expected non-empty affinity key")
+	}
+	if keyA == keyB {
+		t.Fatalf("expected different API keys to produce different affinity keys")
+	}
+	payload.ConversationState.ConversationID = ""
+	if got := routeAffinityKey(payload, "api-key-a"); got != "" {
+		t.Fatalf("expected empty key without conversation id, got %q", got)
+	}
+}
+
 func TestThinkingSourceTagFirst(t *testing.T) {
 	var source thinkingStreamSource
 

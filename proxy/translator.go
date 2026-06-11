@@ -270,12 +270,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether the current tool results form a valid "active" tool turn:
-	// the last history assistant must carry matching structured toolUses. If not
-	// (orphaned tool results, e.g. after context compaction), flatten them into
-	// the current message text so the upstream does not reject the request.
+	// Keep the current tool results structured only when they answer the active
+	// assistant tool turn, or when they carry images that cannot be represented
+	// faithfully as plain text. Text-only orphaned tool results are flattened.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs) ||
+		toolResultsContainImages(currentToolResults)
 
 	// Flatten structured tool calls/results that live in history; upstream only
 	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
@@ -315,7 +315,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	// Only attach structured tool results when they answer the last history
-	// assistant turn; otherwise they have already been folded into finalContent.
+	// assistant turn or carry images; otherwise they have been folded into finalContent.
 	var attachToolResults []KiroToolResult
 	if keepCurrentToolResults {
 		attachToolResults = currentToolResults
@@ -656,6 +656,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
 					Status:    "success",
+					HasImages: len(resultImages) > 0,
 				})
 			}
 		}
@@ -1173,6 +1174,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 				ToolUseID: msg.ToolCallID,
 				Content:   []KiroResultContent{{Text: content}},
 				Status:    "success",
+				HasImages: len(toolImages) > 0,
 			})
 
 			// 检查下一条是否还是 tool
@@ -1219,10 +1221,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether current tool results form a valid active tool turn; if not,
-	// flatten them into the current message text (see ClaudeToKiro for rationale).
+	// Keep current tool results structured for the active tool turn, or when they
+	// carry images. Text-only orphaned results are flattened into message text.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs) ||
+		toolResultsContainImages(currentToolResults)
 
 	if keepCurrentToolResults {
 		history = sanitizeKiroHistory(history, currentToolResultIDs)
@@ -1383,6 +1386,15 @@ func collectToolResultIDs(toolResults []KiroToolResult) map[string]bool {
 		}
 	}
 	return ids
+}
+
+func toolResultsContainImages(toolResults []KiroToolResult) bool {
+	for _, tr := range toolResults {
+		if tr.HasImages {
+			return true
+		}
+	}
+	return false
 }
 
 // currentToolResultsMatchLastAssistant reports whether the current message's
@@ -1553,9 +1565,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
 			if len(ctx.ToolResults) > 0 {
-				narrated := narrateToolResults(ctx.ToolResults, toolNames)
-				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
-				ctx.ToolResults = nil
+				if !toolResultsContainImages(ctx.ToolResults) {
+					narrated := narrateToolResults(ctx.ToolResults, toolNames)
+					msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
+					ctx.ToolResults = nil
+				}
 			}
 			// History messages must not carry structured tool specs either.
 			ctx.Tools = nil
