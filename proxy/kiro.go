@@ -417,6 +417,22 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	assistantIdentityFilter := newIdentityStreamFilter()
+	reasoningIdentityFilter := newIdentityStreamFilter()
+
+	flushIdentityFilters := func() {
+		if callback.OnText == nil {
+			assistantIdentityFilter.Flush()
+			reasoningIdentityFilter.Flush()
+			return
+		}
+		if text := assistantIdentityFilter.Flush(); text != "" {
+			callback.OnText(text, false)
+		}
+		if text := reasoningIdentityFilter.Flush(); text != "" {
+			callback.OnText(text, true)
+		}
+	}
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -465,21 +481,24 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
-				content = rebrandIdentity(content)
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, false)
+					if filtered := assistantIdentityFilter.Push(normalized); filtered != "" {
+						callback.OnText(filtered, false)
+					}
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
-				text = rebrandIdentity(text)
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
-					callback.OnText(normalized, true)
+					if filtered := reasoningIdentityFilter.Push(normalized); filtered != "" {
+						callback.OnText(filtered, true)
+					}
 				}
 			}
 		case "toolUseEvent":
+			flushIdentityFilters()
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -495,8 +514,10 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	}
 
 	if currentToolUse != nil {
+		flushIdentityFilters()
 		finishToolUse(currentToolUse, callback)
 	}
+	flushIdentityFilters()
 
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
@@ -580,17 +601,144 @@ func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {
 	}
 }
 
+const genericAssistantIdentityResponse = "我是一个 AI 助手，可以帮助你编写代码、分析问题、调试错误、规划架构，以及处理各种开发相关的任务。\n\n有什么我可以帮你的？"
+
 var identityReplacer = strings.NewReplacer(
-	"Kiro", "Claude",
-	"KIRO", "Claude",
-	"kiro", "Claude",
+	"Kiro IDE", "AI 开发助手",
+	"KiroIDE", "AI 开发助手",
+	"Kiro", "AI 助手",
+	"KIRO", "AI 助手",
+	"kiro", "AI 助手",
 )
 
 func rebrandIdentity(s string) string {
 	if s == "" || !strings.Contains(strings.ToLower(s), "kiro") {
 		return s
 	}
+	if isKiroIdentityResponse(s) {
+		return genericAssistantIdentityResponse
+	}
 	return identityReplacer.Replace(s)
+}
+
+func isKiroIdentityResponse(s string) bool {
+	lower := strings.ToLower(strings.Join(strings.Fields(s), " "))
+	compact := strings.ReplaceAll(lower, " ", "")
+
+	identityMarkers := []string{
+		"我是kiro",
+		"我叫kiro",
+		"我是一个kiro",
+		"i am kiro",
+		"i'm kiro",
+		"im kiro",
+		"kiro is",
+		"kiro, an",
+		"kiro，",
+	}
+	for _, marker := range identityMarkers {
+		if strings.Contains(compact, strings.ReplaceAll(marker, " ", "")) ||
+			strings.Contains(lower, marker) {
+			return true
+		}
+	}
+
+	productMarkers := []string{
+		"ai 驱动的开发环境",
+		"ai驱动的开发环境",
+		"开发环境",
+		"有什么我可以帮",
+		"what can i help",
+	}
+	for _, marker := range productMarkers {
+		if strings.Contains(lower, marker) || strings.Contains(compact, strings.ReplaceAll(marker, " ", "")) {
+			return true
+		}
+	}
+	return false
+}
+
+type identityStreamFilter struct {
+	buffer      string
+	passThrough bool
+	suppress    bool
+}
+
+func newIdentityStreamFilter() *identityStreamFilter {
+	return &identityStreamFilter{}
+}
+
+func (f *identityStreamFilter) Push(chunk string) string {
+	if chunk == "" || f.suppress {
+		return ""
+	}
+	if f.passThrough {
+		return rebrandIdentity(chunk)
+	}
+
+	f.buffer += chunk
+	if isKiroIdentityResponse(f.buffer) {
+		f.buffer = ""
+		f.suppress = true
+		return genericAssistantIdentityResponse
+	}
+	if shouldHoldIdentityBuffer(f.buffer) {
+		return ""
+	}
+
+	f.passThrough = true
+	out := rebrandIdentity(f.buffer)
+	f.buffer = ""
+	return out
+}
+
+func (f *identityStreamFilter) Flush() string {
+	if f.suppress || f.buffer == "" {
+		f.buffer = ""
+		return ""
+	}
+	out := rebrandIdentity(f.buffer)
+	f.buffer = ""
+	f.passThrough = true
+	return out
+}
+
+func shouldHoldIdentityBuffer(s string) bool {
+	if s == "" {
+		return false
+	}
+	if len([]rune(s)) >= 256 {
+		return false
+	}
+
+	lower := strings.ToLower(strings.Join(strings.Fields(s), " "))
+	compact := strings.ReplaceAll(lower, " ", "")
+	if strings.Contains(compact, "kiro") {
+		return !hasIdentityBufferBoundary(s) && len([]rune(s)) < 160
+	}
+
+	prefixes := []string{
+		"我是",
+		"我叫",
+		"你好我是",
+		"您好我是",
+		"iam",
+		"i'm",
+		"im",
+		"ki",
+		"kir",
+		"k",
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(compact, prefix) {
+			return !hasIdentityBufferBoundary(s) && len([]rune(s)) < 160
+		}
+	}
+	return false
+}
+
+func hasIdentityBufferBoundary(s string) bool {
+	return strings.ContainsAny(s, "\n。！？!?")
 }
 
 func normalizeChunk(chunk string, previous *string) string {

@@ -7,6 +7,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,6 +105,63 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
+	}
+}
+
+func TestRebrandIdentityRewritesKiroSelfIntro(t *testing.T) {
+	input := "我是 Kiro，一个 AI 驱动的开发环境。有什么我可以帮你的？"
+	got := rebrandIdentity(input)
+	if strings.Contains(strings.ToLower(got), "kiro") {
+		t.Fatalf("expected Kiro identity to be removed, got %q", got)
+	}
+	if !strings.Contains(got, "AI 助手") {
+		t.Fatalf("expected generic assistant identity, got %q", got)
+	}
+}
+
+func TestParseEventStreamDoesNotEmitKiroIdentity(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "我是 Kiro，一个 AI 驱动的开发环境。有什么我可以帮你的？",
+	}))
+
+	var text string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(chunk string, _ bool) {
+			text += chunk
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if strings.Contains(strings.ToLower(text), "kiro") {
+		t.Fatalf("expected streamed identity to be sanitized, got %q", text)
+	}
+	if !strings.Contains(text, "AI 助手") {
+		t.Fatalf("expected generic assistant identity, got %q", text)
+	}
+}
+
+func TestParseEventStreamDoesNotEmitSplitKiroIdentity(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "我是 Ki"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ro，一个 AI 驱动的开发环境。"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "我可以帮你编写代码、调试问题。"}),
+	}, nil))
+
+	var text string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(chunk string, _ bool) {
+			text += chunk
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if strings.Contains(strings.ToLower(text), "kiro") {
+		t.Fatalf("expected split identity to be sanitized, got %q", text)
+	}
+	if text != genericAssistantIdentityResponse {
+		t.Fatalf("expected only generic assistant identity, got %q", text)
 	}
 }
 
