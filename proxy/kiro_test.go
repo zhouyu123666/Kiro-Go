@@ -283,6 +283,22 @@ func TestSetPayloadProfileArnForAccountPreservesExplicitPayloadArn(t *testing.T)
 	}
 }
 
+func TestAmazonQEndpointUsesGenerateAssistantResponsePayloadShape(t *testing.T) {
+	for _, ep := range kiroEndpoints {
+		if ep.Name != "AmazonQ" {
+			continue
+		}
+		if strings.Contains(ep.AmzTarget, "SendMessage") {
+			t.Fatalf("AmazonQ endpoint must not use SendMessage target with GenerateAssistantResponse payloads")
+		}
+		if !strings.HasSuffix(ep.URL, "/generateAssistantResponse") {
+			t.Fatalf("expected AmazonQ endpoint to use generateAssistantResponse path, got %q", ep.URL)
+		}
+		return
+	}
+	t.Fatalf("AmazonQ endpoint not found")
+}
+
 func mustParseURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
 	parsed, err := url.Parse(raw)

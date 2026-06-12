@@ -42,9 +42,12 @@ var kiroEndpoints = []kiroEndpoint{
 		Name:      "CodeWhisperer",
 	},
 	{
-		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
-		Origin:    "AI_EDITOR",
-		AmzTarget: "AmazonQDeveloperStreamingService.SendMessage",
+		URL:    "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+		Origin: "AI_EDITOR",
+		// SendMessage uses a different Amazon Q payload shape. The proxy builds a
+		// GenerateAssistantResponse conversationState payload, so keep this endpoint
+		// on the REST-style operation path instead of setting the SendMessage target.
+		AmzTarget: "",
 		Name:      "AmazonQ",
 	},
 }
