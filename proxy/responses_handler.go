@@ -288,6 +288,10 @@ func (h *Handler) handleResponsesStream(
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, string(data))
 		flusher.Flush()
 	}
+	sendDone := func() {
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}
 
 	createdAt := time.Now().Unix()
 	initial := &ResponsesObject{
@@ -441,6 +445,12 @@ func (h *Handler) handleResponsesStream(
 					"output_index": outputIndex,
 					"delta":        string(args),
 				})
+				send("response.function_call_arguments.done", map[string]interface{}{
+					"type":         "response.function_call_arguments.done",
+					"item_id":      fcID,
+					"output_index": outputIndex,
+					"arguments":    string(args),
+				})
 				send("response.output_item.done", map[string]interface{}{
 					"type":         "response.output_item.done",
 					"output_index": outputIndex,
@@ -480,6 +490,7 @@ func (h *Handler) handleResponsesStream(
 				},
 			})
 			h.recordFailure()
+			sendDone()
 			return
 		}
 
@@ -541,8 +552,7 @@ func (h *Handler) handleResponsesStream(
 			"type":     "response.completed",
 			"response": respObj,
 		})
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		sendDone()
 		return
 	}
 
@@ -558,6 +568,7 @@ func (h *Handler) handleResponsesStream(
 				},
 			},
 		})
+		sendDone()
 		return
 	}
 	h.recordFailure()
@@ -572,4 +583,5 @@ func (h *Handler) handleResponsesStream(
 			},
 		},
 	})
+	sendDone()
 }

@@ -229,6 +229,35 @@ func TestOpenAINonStreamIgnoresContextUsageForPromptTokens(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamSendsDoneAfterPartialUpstreamError(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": strings.Repeat("streamed text ", 8),
+		}))
+		_, _ = w.Write([]byte{0, 0, 0})
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{"model":"claude-sonnet-4.5","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIChat(rec, req)
+
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, `"error"`) {
+		t.Fatalf("expected streamed error payload, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "data: [DONE]") {
+		t.Fatalf("expected stream to terminate with [DONE], got:\n%s", bodyStr)
+	}
+}
+
 func TestRouteAffinityKeyUsesConversationAndAPIKey(t *testing.T) {
 	payload := &KiroPayload{}
 	payload.ConversationState.ConversationID = "conversation-1"

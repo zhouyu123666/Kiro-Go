@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"kiro-go/config"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -20,6 +22,30 @@ func TestExtractOpenAIMessageTextStructured(t *testing.T) {
 	}
 	if got := extractOpenAIMessageText(nested); got != "nested" {
 		t.Fatalf("expected nested content extraction, got %q", got)
+	}
+}
+
+func TestClaudeCodePromptReplacementKeepsToolUseGuidance(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config init: %v", err)
+	}
+	if err := config.UpdatePromptFilterConfig(true, false, false, nil); err != nil {
+		t.Fatalf("enable prompt filter: %v", err)
+	}
+
+	prompt := `You are Claude Code, Anthropic's official CLI.
+# Doing tasks
+# Using your tools`
+
+	filtered := applyPromptFilters(prompt)
+	if filtered != claudeCodeBackendPrompt {
+		t.Fatalf("expected Claude Code prompt replacement, got %q", filtered)
+	}
+	if !strings.Contains(filtered, "call the appropriate tool") {
+		t.Fatalf("expected replacement prompt to preserve tool-use guidance, got %q", filtered)
+	}
+	if strings.Contains(filtered, "# Using your tools") {
+		t.Fatalf("expected bulky original prompt to be replaced, got %q", filtered)
 	}
 }
 
@@ -362,9 +388,15 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 		"additionalProperties": false,
 	}
 
-	tools := convertOpenAITools([]OpenAITool{tool})
+	tools, nameMap := convertOpenAITools([]OpenAITool{tool})
 	if len(tools) != 1 {
 		t.Fatalf("expected one converted tool, got %d", len(tools))
+	}
+	if tools[0].ToolSpecification.Name != "readFile" {
+		t.Fatalf("expected OpenAI tool name to be sanitized for Kiro, got %q", tools[0].ToolSpecification.Name)
+	}
+	if nameMap["readFile"] != "read_file" {
+		t.Fatalf("expected original OpenAI tool name mapping, got %#v", nameMap)
 	}
 	if strings.TrimSpace(tools[0].ToolSpecification.Description) == "" {
 		t.Fatalf("expected fallback tool description")

@@ -425,4 +425,84 @@ func TestResponsesStreamSSE(t *testing.T) {
 	if !strings.Contains(bodyStr, "stream chunk") {
 		t.Fatalf("expected stream content delta, got:\n%s", bodyStr)
 	}
+	if !strings.Contains(bodyStr, "data: [DONE]") {
+		t.Fatalf("expected stream to terminate with [DONE], got:\n%s", bodyStr)
+	}
+}
+
+func TestResponsesStreamFunctionCallSendsArgumentsDone(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "call_1",
+			"name":      "readFile",
+			"input":     `{"path":"README.md"}`,
+			"stop":      true,
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"input":"inspect the repo",
+		"stream":true,
+		"store":false,
+		"tools":[{"type":"function","name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIResponses(rec, req)
+
+	bodyStr := rec.Body.String()
+	for _, evt := range []string{
+		"event: response.output_item.added",
+		"event: response.function_call_arguments.delta",
+		"event: response.function_call_arguments.done",
+		"event: response.output_item.done",
+		"event: response.completed",
+	} {
+		if !strings.Contains(bodyStr, evt) {
+			t.Fatalf("missing event %q in stream body:\n%s", evt, bodyStr)
+		}
+	}
+	if !strings.Contains(bodyStr, `"arguments":"{\"path\":\"README.md\"}"`) {
+		t.Fatalf("expected completed arguments payload, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"name":"read_file"`) {
+		t.Fatalf("expected original tool name to be restored, got:\n%s", bodyStr)
+	}
+}
+
+func TestResponsesStreamFailureTerminatesWithDone(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": strings.Repeat("partial response ", 8),
+		}))
+		_, _ = w.Write([]byte{0, 0, 0})
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	body := strings.NewReader(`{"model":"claude-sonnet-4.5","input":"stream please","stream":true,"store":false}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", body)
+	rec := httptest.NewRecorder()
+
+	h.handleOpenAIResponses(rec, req)
+
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, "event: response.failed") {
+		t.Fatalf("expected response.failed event, got:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "data: [DONE]") {
+		t.Fatalf("expected failed stream to terminate with [DONE], got:\n%s", bodyStr)
+	}
 }

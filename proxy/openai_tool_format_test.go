@@ -41,13 +41,14 @@ func TestOpenAIToolAcceptsNestedFormat(t *testing.T) {
 }
 
 // TestConvertOpenAIToolsEmitsNonEmptyNames ensures the converter never emits a
-// tool spec with an empty name (Kiro rejects those) and preserves valid names.
+// tool spec with an empty name (Kiro rejects those) and records original names
+// so client tool registries still match returned function calls.
 func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
 	tools := []OpenAITool{
 		mustTool(t, `{"type":"function","name":"exec_command","parameters":{"type":"object"}}`),
 		mustTool(t, `{"type":"function","function":{"name":"update_plan","parameters":{"type":"object"}}}`),
 	}
-	wrappers := convertOpenAITools(tools)
+	wrappers, nameMap := convertOpenAITools(tools)
 	if len(wrappers) != 2 {
 		t.Fatalf("expected 2 tool wrappers, got %d", len(wrappers))
 	}
@@ -56,11 +57,14 @@ func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
 			t.Fatalf("tool %d has empty name", i)
 		}
 	}
-	if wrappers[0].ToolSpecification.Name != "exec_command" {
-		t.Fatalf("expected exec_command preserved, got %q", wrappers[0].ToolSpecification.Name)
+	if wrappers[0].ToolSpecification.Name != "execCommand" {
+		t.Fatalf("expected exec_command sanitized for Kiro, got %q", wrappers[0].ToolSpecification.Name)
 	}
-	if wrappers[1].ToolSpecification.Name != "update_plan" {
-		t.Fatalf("expected update_plan preserved, got %q", wrappers[1].ToolSpecification.Name)
+	if wrappers[1].ToolSpecification.Name != "updatePlan" {
+		t.Fatalf("expected update_plan sanitized for Kiro, got %q", wrappers[1].ToolSpecification.Name)
+	}
+	if nameMap["execCommand"] != "exec_command" || nameMap["updatePlan"] != "update_plan" {
+		t.Fatalf("expected original tool name mapping, got %#v", nameMap)
 	}
 }
 

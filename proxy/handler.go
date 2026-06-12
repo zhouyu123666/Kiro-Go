@@ -1835,6 +1835,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailure()
+			h.sendOpenAIStreamError(w, flusher, "server_error", err.Error())
 			return
 		}
 
@@ -1900,6 +1901,19 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 	h.recordFailure()
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+}
+
+func (h *Handler) sendOpenAIStreamError(w http.ResponseWriter, flusher http.Flusher, errType, message string) {
+	payload := map[string]interface{}{
+		"error": map[string]string{
+			"type":    errType,
+			"message": message,
+		},
+	}
+	data, _ := json.Marshal(payload)
+	fmt.Fprintf(w, "data: %s\n\n", string(data))
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // handleOpenAINonStream OpenAI 非流式响应

@@ -218,9 +218,10 @@ type KiroAssistantResponseMessage struct {
 }
 
 type KiroToolUse struct {
-	ToolUseID string                 `json:"toolUseId"`
-	Name      string                 `json:"name"`
-	Input     map[string]interface{} `json:"input"`
+	ToolUseID    string                 `json:"toolUseId"`
+	Name         string                 `json:"name"`
+	Input        map[string]interface{} `json:"input"`
+	OriginalName string                 `json:"-"`
 }
 
 type InferenceConfig struct {
