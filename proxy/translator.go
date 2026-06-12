@@ -761,15 +761,18 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 				}
 			case "tool_use":
 				id, _ := block["id"].(string)
-				name, _ := block["name"].(string)
+				originalName, _ := block["name"].(string)
+				originalName = strings.TrimSpace(originalName)
+				name := shortenToolName(sanitizeToolName(originalName))
 				input, _ := block["input"].(map[string]interface{})
 				if input == nil {
 					input = make(map[string]interface{})
 				}
 				toolUses = append(toolUses, KiroToolUse{
-					ToolUseID: id,
-					Name:      name,
-					Input:     input,
+					ToolUseID:    id,
+					Name:         name,
+					Input:        input,
+					OriginalName: originalName,
 				})
 			}
 		}

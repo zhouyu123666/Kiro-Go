@@ -122,6 +122,12 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 	if last == nil || len(last.ToolUses) != 1 || last.ToolUses[0].ToolUseID != "t9" {
 		t.Fatalf("expected last history assistant to keep the active structured tool use t9")
 	}
+	if last.ToolUses[0].Name != "execCommand" {
+		t.Fatalf("expected active tool use name sanitized for Kiro, got %q", last.ToolUses[0].Name)
+	}
+	if last.ToolUses[0].OriginalName != "exec_command" {
+		t.Fatalf("expected active tool use original name preserved, got %q", last.ToolUses[0].OriginalName)
+	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
