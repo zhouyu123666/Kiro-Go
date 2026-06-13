@@ -410,6 +410,26 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeToolsSanitizesNamespacedToolName(t *testing.T) {
+	tools, nameMap := convertClaudeTools([]ClaudeTool{{
+		Name:        "functions.exec-command",
+		Description: "Run a command",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+		},
+	}})
+
+	if len(tools) != 1 {
+		t.Fatalf("expected one converted tool, got %d", len(tools))
+	}
+	if got := tools[0].ToolSpecification.Name; got != "functionsExecCommand" {
+		t.Fatalf("expected namespaced Claude tool name to be sanitized, got %q", got)
+	}
+	if nameMap["functionsExecCommand"] != "functions.exec-command" {
+		t.Fatalf("expected original Claude tool name mapping, got %#v", nameMap)
+	}
+}
+
 func schemaContainsKey(value interface{}, key string) bool {
 	switch v := value.(type) {
 	case map[string]interface{}:

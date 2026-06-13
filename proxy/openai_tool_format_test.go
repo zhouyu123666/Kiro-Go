@@ -46,11 +46,12 @@ func TestOpenAIToolAcceptsNestedFormat(t *testing.T) {
 func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
 	tools := []OpenAITool{
 		mustTool(t, `{"type":"function","name":"exec_command","parameters":{"type":"object"}}`),
-		mustTool(t, `{"type":"function","function":{"name":"update_plan","parameters":{"type":"object"}}}`),
+		mustTool(t, `{"type":"function","function":{"name":"functions.update-plan","parameters":{"type":"object"}}}`),
+		mustTool(t, `{"type":"function","function":{"name":"123_search","parameters":{"type":"object"}}}`),
 	}
 	wrappers, nameMap := convertOpenAITools(tools)
-	if len(wrappers) != 2 {
-		t.Fatalf("expected 2 tool wrappers, got %d", len(wrappers))
+	if len(wrappers) != 3 {
+		t.Fatalf("expected 3 tool wrappers, got %d", len(wrappers))
 	}
 	for i, w := range wrappers {
 		if w.ToolSpecification.Name == "" {
@@ -60,10 +61,15 @@ func TestConvertOpenAIToolsEmitsNonEmptyNames(t *testing.T) {
 	if wrappers[0].ToolSpecification.Name != "execCommand" {
 		t.Fatalf("expected exec_command sanitized for Kiro, got %q", wrappers[0].ToolSpecification.Name)
 	}
-	if wrappers[1].ToolSpecification.Name != "updatePlan" {
-		t.Fatalf("expected update_plan sanitized for Kiro, got %q", wrappers[1].ToolSpecification.Name)
+	if wrappers[1].ToolSpecification.Name != "functionsUpdatePlan" {
+		t.Fatalf("expected dotted function name sanitized for Kiro, got %q", wrappers[1].ToolSpecification.Name)
 	}
-	if nameMap["execCommand"] != "exec_command" || nameMap["updatePlan"] != "update_plan" {
+	if wrappers[2].ToolSpecification.Name != "tool123Search" {
+		t.Fatalf("expected digit-prefixed name to receive tool prefix, got %q", wrappers[2].ToolSpecification.Name)
+	}
+	if nameMap["execCommand"] != "exec_command" ||
+		nameMap["functionsUpdatePlan"] != "functions.update-plan" ||
+		nameMap["tool123Search"] != "123_search" {
 		t.Fatalf("expected original tool name mapping, got %#v", nameMap)
 	}
 }

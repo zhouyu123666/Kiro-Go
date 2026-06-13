@@ -887,17 +887,14 @@ func normalizeToolDesc(desc, name string) string {
 }
 
 // sanitizeToolName normalizes a tool name to characters the Kiro API accepts.
-// Kiro tool names must be pure camelCase (no underscores or dashes).
-// Separators (_, -, and multi-underscore namespace prefixes) are converted to camelCase boundaries.
+// Kiro tool names must be ASCII camelCase; separators and namespace markers are
+// converted to camelCase boundaries.
 func sanitizeToolName(name string) string {
-	// Split on underscores and dashes, including multi-underscore namespace prefixes.
-	parts := strings.FieldsFunc(name, func(r rune) bool {
-		return r == '_' || r == '-'
-	})
+	parts := splitToolNameParts(name)
 	if len(parts) == 0 {
 		return "tool"
 	}
-	// Build camelCase: first part lowercase start, rest capitalize first letter
+
 	var b strings.Builder
 	for i, part := range parts {
 		if part == "" {
@@ -913,7 +910,42 @@ func sanitizeToolName(name string) string {
 	if result == "" {
 		return "tool"
 	}
+	if !isASCIILetter(result[0]) {
+		result = "tool" + strings.ToUpper(result[:1]) + result[1:]
+	}
 	return result
+}
+
+func splitToolNameParts(name string) []string {
+	var parts []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() == 0 {
+			return
+		}
+		parts = append(parts, b.String())
+		b.Reset()
+	}
+
+	for _, r := range strings.TrimSpace(name) {
+		if isASCIIAlphaNumeric(r) {
+			b.WriteRune(r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return parts
+}
+
+func isASCIIAlphaNumeric(r rune) bool {
+	return (r >= 'a' && r <= 'z') ||
+		(r >= 'A' && r <= 'Z') ||
+		(r >= '0' && r <= '9')
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 func shortenToolName(name string) string {
@@ -1616,18 +1648,30 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				continue // drop hollow assistant turn
 			}
 		}
-		// Collapse runs of consecutive identical user "Tool results" turns. A
-		// client stuck in a retry loop (e.g. the same tool error 100+ times)
-		// sends many identical tool results; once the hollow assistant turns
-		// between them are dropped they become adjacent duplicates that waste
-		// context and form a repetitive pattern. Keep one copy of each run.
-		if msg.UserInputMessage != nil && len(cleaned) > 0 {
-			last := cleaned[len(cleaned)-1]
+		// Merge consecutive user turns. Dropping hollow assistant turns above
+		// can leave two user "Tool results" turns adjacent (a long session with
+		// several single-tool-call assistant turns produces exactly this shape).
+		// Kiro's upstream requires strict user/assistant alternation and rejects
+		// consecutive same-role turns with HTTP 400 "Improperly formed request".
+		// Identical content is collapsed to a single copy (a client stuck in a
+		// retry loop replays the same tool error many times); differing content
+		// is concatenated so no tool output is lost. Turns carrying images or
+		// structured tool context are kept standalone to preserve their shape.
+		if msg.UserInputMessage != nil &&
+			len(msg.UserInputMessage.Images) == 0 &&
+			msg.UserInputMessage.UserInputMessageContext == nil &&
+			len(cleaned) > 0 {
+			last := &cleaned[len(cleaned)-1]
 			if last.UserInputMessage != nil &&
-				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
-				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
-				len(msg.UserInputMessage.Images) == 0 {
-				continue // skip duplicate consecutive user turn
+				len(last.UserInputMessage.Images) == 0 &&
+				last.UserInputMessage.UserInputMessageContext == nil {
+				prev := strings.TrimSpace(last.UserInputMessage.Content)
+				cur := strings.TrimSpace(msg.UserInputMessage.Content)
+				if cur == "" || cur == prev {
+					continue // skip empty/duplicate consecutive user turn
+				}
+				last.UserInputMessage.Content = joinHistoryText(last.UserInputMessage.Content, msg.UserInputMessage.Content)
+				continue // merged into the previous user turn
 			}
 		}
 		cleaned = append(cleaned, msg)
