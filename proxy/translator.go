@@ -1683,12 +1683,134 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				continue // merged into the previous user turn
 			}
 		}
+		// Merge consecutive assistant turns. The same upstream alternation rule
+		// applies on the assistant side: dropping a hollow user/assistant turn (or
+		// a client replaying split assistant turns) can leave two assistant turns
+		// adjacent, which upstream rejects with the same HTTP 400. Assistant turns
+		// carrying structured toolUses are the active tool turn and must stay
+		// standalone, so only plain-text assistant turns are merged here.
+		if msg.AssistantResponseMessage != nil &&
+			len(msg.AssistantResponseMessage.ToolUses) == 0 &&
+			len(cleaned) > 0 {
+			last := &cleaned[len(cleaned)-1]
+			if last.AssistantResponseMessage != nil &&
+				len(last.AssistantResponseMessage.ToolUses) == 0 {
+				prev := strings.TrimSpace(last.AssistantResponseMessage.Content)
+				cur := strings.TrimSpace(msg.AssistantResponseMessage.Content)
+				if cur == "" || cur == prev {
+					continue // skip empty/duplicate consecutive assistant turn
+				}
+				last.AssistantResponseMessage.Content = joinHistoryText(last.AssistantResponseMessage.Content, msg.AssistantResponseMessage.Content)
+				continue // merged into the previous assistant turn
+			}
+		}
 		cleaned = append(cleaned, msg)
 	}
 
 	// Dropping hollow assistant turns can leave history starting with an
 	// assistant message; re-trim so it begins with a user turn.
-	return trimLeadingAssistantHistory(cleaned)
+	cleaned = trimLeadingAssistantHistory(cleaned)
+
+	// Final guarantee: enforce strict user/assistant alternation. The merge passes
+	// above handle the common shapes, but structural edge cases can still leave two
+	// same-role turns adjacent — e.g. a plain-text assistant turn directly before an
+	// active tool turn (assistant with structured toolUses), which neither merge
+	// pass touches because one side carries structure. Upstream rejects ANY adjacent
+	// same-role pair with HTTP 400 "Improperly formed request", so this final pass
+	// coalesces whatever remains, preserving the structure-bearing side intact.
+	return enforceHistoryAlternation(cleaned)
+}
+
+// enforceHistoryAlternation collapses any remaining adjacent same-role turns so
+// the history strictly alternates user/assistant, which the upstream requires.
+//
+// When two same-role turns are adjacent, they are merged into one:
+//   - The structure-bearing turn (assistant toolUses, or user images/tool context)
+//     is kept as the surviving entry so pairing with the current message stays
+//     intact; only the other turn's plain text is folded into its content.
+//   - If neither carries structure, the earlier turn survives and the later turn's
+//     text is appended.
+//
+// This is a safety net, not the primary mechanism: the dedicated merge passes
+// above already handle the common cases. It exists so no structural edge case can
+// produce a malformed (non-alternating) payload.
+func enforceHistoryAlternation(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) < 2 {
+		return history
+	}
+
+	out := history[:0:0]
+	for i := range history {
+		msg := history[i]
+		if len(out) == 0 {
+			out = append(out, msg)
+			continue
+		}
+		last := &out[len(out)-1]
+		if historyRole(*last) != historyRole(msg) {
+			out = append(out, msg)
+			continue
+		}
+
+		// Same role as the previous surviving turn: merge into it.
+		if msg.AssistantResponseMessage != nil {
+			mergeAssistantTurns(last, msg)
+		} else if msg.UserInputMessage != nil {
+			mergeUserTurns(last, msg)
+		}
+	}
+	return out
+}
+
+// historyRole returns "user", "assistant", or "" for a history entry.
+func historyRole(m KiroHistoryMessage) string {
+	switch {
+	case m.UserInputMessage != nil:
+		return "user"
+	case m.AssistantResponseMessage != nil:
+		return "assistant"
+	default:
+		return ""
+	}
+}
+
+// mergeAssistantTurns folds incoming assistant text into the surviving assistant
+// turn. If only one side carries structured toolUses, that side's toolUses are
+// retained; the other side's text is merged in. If both carry toolUses, the
+// incoming text is appended and the incoming toolUses are dropped (the surviving
+// turn already holds the active structured tool call).
+func mergeAssistantTurns(last *KiroHistoryMessage, incoming KiroHistoryMessage) {
+	if last.AssistantResponseMessage == nil || incoming.AssistantResponseMessage == nil {
+		return
+	}
+	la := last.AssistantResponseMessage
+	ia := incoming.AssistantResponseMessage
+
+	// Preserve the active tool turn's structured toolUses. If the surviving turn
+	// has none but the incoming one does, adopt the incoming toolUses so the
+	// pairing with the current message's tool results is not lost.
+	if len(la.ToolUses) == 0 && len(ia.ToolUses) > 0 {
+		la.ToolUses = ia.ToolUses
+	}
+	la.Content = joinHistoryText(la.Content, ia.Content)
+}
+
+// mergeUserTurns folds incoming user text into the surviving user turn, keeping
+// any structured tool context / images on whichever side carries them.
+func mergeUserTurns(last *KiroHistoryMessage, incoming KiroHistoryMessage) {
+	if last.UserInputMessage == nil || incoming.UserInputMessage == nil {
+		return
+	}
+	lu := last.UserInputMessage
+	iu := incoming.UserInputMessage
+
+	if lu.UserInputMessageContext == nil && iu.UserInputMessageContext != nil {
+		lu.UserInputMessageContext = iu.UserInputMessageContext
+	}
+	if len(lu.Images) == 0 && len(iu.Images) > 0 {
+		lu.Images = iu.Images
+	}
+	lu.Content = joinHistoryText(lu.Content, iu.Content)
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
