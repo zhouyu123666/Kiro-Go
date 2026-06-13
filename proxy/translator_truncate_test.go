@@ -89,6 +89,82 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 	}
 }
 
+// TestClaudeToKiroTruncatesOversizedCurrentToolResult covers the case where the
+// active tool turn's result is itself larger than the upstream input limit (e.g.
+// reading a huge file). The structured tool result must be shrunk below
+// maxPayloadBytes while preserving the toolUseId pairing so the request stays
+// well-formed.
+func TestClaudeToKiroTruncatesOversizedCurrentToolResult(t *testing.T) {
+	huge := strings.Repeat("X", maxPayloadBytes+200*1024) // well over the limit
+
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Tools: []ClaudeTool{{Name: "read_file", Description: "read", InputSchema: map[string]interface{}{"type": "object"}}},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "read the big file"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "tr1", "name": "read_file", "input": map[string]interface{}{"path": "big.txt"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tr1", "content": huge},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	if sz := payloadByteSize(payload); sz > maxPayloadBytes {
+		t.Fatalf("payload size %d exceeds limit %d after truncating tool result", sz, maxPayloadBytes)
+	}
+
+	// The active tool turn must remain structured and paired (tr1 on both sides).
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected the structured tool result to be preserved")
+	}
+	if cur.UserInputMessageContext.ToolResults[0].ToolUseID != "tr1" {
+		t.Fatalf("expected tool result to still answer tr1, got %q", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
+	}
+	hist := payload.ConversationState.History
+	last := hist[len(hist)-1].AssistantResponseMessage
+	if last == nil || len(last.ToolUses) != 1 || last.ToolUses[0].ToolUseID != "tr1" {
+		t.Fatalf("expected the active assistant tool use tr1 to remain structured")
+	}
+}
+
+// TestClaudeToKiroDropsOversizedCurrentImage covers the case where an attached
+// image alone exceeds the upstream input limit. The image must be dropped (it
+// cannot be shrunk losslessly) and a note left so the model knows.
+func TestClaudeToKiroDropsOversizedCurrentImage(t *testing.T) {
+	// A valid base64 blob larger than the payload limit.
+	hugeB64 := strings.Repeat("QUFB", (maxPayloadBytes+200*1024)/4) // base64 of "AAA"*
+
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "what is in this screenshot?"},
+				map[string]interface{}{"type": "image", "source": map[string]interface{}{
+					"type": "base64", "media_type": "image/png", "data": hugeB64,
+				}},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	if sz := payloadByteSize(payload); sz > maxPayloadBytes {
+		t.Fatalf("payload size %d exceeds limit %d after dropping image", sz, maxPayloadBytes)
+	}
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 0 {
+		t.Fatalf("expected oversized image to be dropped, still have %d", len(cur.Images))
+	}
+	if !strings.Contains(cur.Content, "image") {
+		t.Fatalf("expected current content to retain the user's question text, got %q", cur.Content)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

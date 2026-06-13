@@ -60,6 +60,15 @@ const maxPayloadBytes = 900 * 1024
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
 
+// toolResultTruncatedNote is appended to a current-message tool result whose text
+// was shortened to keep the payload within maxPayloadBytes. The structure
+// (toolUseId/pairing) is preserved; only the text body is trimmed.
+const toolResultTruncatedNote = "\n[Tool result truncated to fit the model's input limit.]"
+
+// imagesDroppedNote is appended to the current message when its attached images
+// had to be dropped as a last resort to fit within maxPayloadBytes.
+const imagesDroppedNote = "\n[Attached image(s) were omitted because the request exceeded the model's input limit.]"
+
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
@@ -1794,11 +1803,17 @@ func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
 
-// truncateCurrentMessage hard-truncates the current message content as a last
-// resort when even the minimal retained history plus current message exceeds the
-// limit.
+// truncateCurrentMessage shrinks the current message as a last resort when even
+// the minimal retained history plus current message exceeds the limit. It trims
+// the largest payload contributors in order of least-damaging first:
+//  1. the plain text Content,
+//  2. the structured tool-result text bodies (structure/pairing preserved),
+//  3. the attached images (dropped entirely, with the active tool turn flattened
+//     so the now-orphaned structured results don't break upstream pairing).
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+
+	// 1. Trim the plain text content to whatever budget the rest of the payload leaves.
 	overhead := payloadByteSize(payload) - len(cur.Content)
 	budget := maxPayloadBytes - overhead
 	if budget < 0 {
@@ -1807,9 +1822,109 @@ func truncateCurrentMessage(payload *KiroPayload) {
 	if len(cur.Content) > budget {
 		if budget == 0 {
 			cur.Content = minimalFallbackUserContent
+		} else {
+			cur.Content = cur.Content[:budget]
+		}
+	}
+	if payloadByteSize(payload) <= maxPayloadBytes {
+		return
+	}
+
+	// 2. Shrink structured tool-result text bodies. Keep the toolUseId/pairing so
+	//    the request stays well-formed; only the (potentially huge) text shrinks.
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		truncateToolResultsToLimit(payload)
+		if payloadByteSize(payload) <= maxPayloadBytes {
 			return
 		}
-		cur.Content = cur.Content[:budget]
+	}
+
+	// 3. Drop attached images outright. Base64 images can each be hundreds of KB
+	//    and cannot be shrunk losslessly, so this is the final lever. Dropping the
+	//    structured tool results that referenced those images would break pairing,
+	//    so flatten the active tool turn into narrated text first.
+	if len(cur.Images) > 0 {
+		cur.Images = nil
+		cur.Content = strings.TrimSpace(cur.Content + imagesDroppedNote)
+		// Any structured tool results that only made sense alongside the images
+		// are flattened so no orphaned structured turn remains.
+		if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+			flattenCurrentToolResults(payload)
+		}
+		if payloadByteSize(payload) <= maxPayloadBytes {
+			return
+		}
+		// Re-trim text now that images are gone and the budget changed.
+		overhead = payloadByteSize(payload) - len(cur.Content)
+		budget = maxPayloadBytes - overhead
+		if budget < 0 {
+			budget = 0
+		}
+		if len(cur.Content) > budget {
+			if budget == 0 {
+				cur.Content = minimalFallbackUserContent
+			} else {
+				cur.Content = cur.Content[:budget]
+			}
+		}
+	}
+}
+
+// truncateToolResultsToLimit shrinks the text bodies of the current message's
+// structured tool results so the serialized payload fits within maxPayloadBytes.
+// The toolUseId and result structure are preserved (pairing stays intact); only
+// the text content is trimmed, longest results first.
+func truncateToolResultsToLimit(payload *KiroPayload) {
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil {
+		return
+	}
+	results := cur.UserInputMessageContext.ToolResults
+
+	for payloadByteSize(payload) > maxPayloadBytes {
+		// Find the result with the largest text body.
+		largestIdx, largestContentIdx, largestLen := -1, -1, 0
+		for ri := range results {
+			for ci := range results[ri].Content {
+				if l := len(results[ri].Content[ci].Text); l > largestLen {
+					largestLen = l
+					largestIdx, largestContentIdx = ri, ci
+				}
+			}
+		}
+		if largestIdx == -1 || largestLen == 0 {
+			return // nothing left to trim here
+		}
+
+		over := payloadByteSize(payload) - maxPayloadBytes
+		text := results[largestIdx].Content[largestContentIdx].Text
+		// Cut at least the overflow plus room for the note; keep going if needed.
+		cut := over + len(toolResultTruncatedNote)
+		newLen := len(text) - cut
+		if newLen < 0 {
+			newLen = 0
+		}
+		results[largestIdx].Content[largestContentIdx].Text = text[:newLen] + toolResultTruncatedNote
+		// Guard against an infinite loop if trimming a single body isn't enough.
+		if newLen == 0 && largestLen <= len(toolResultTruncatedNote) {
+			return
+		}
+	}
+}
+
+// flattenCurrentToolResults narrates the current message's structured tool
+// results into its text content and removes the structured results, so no
+// orphaned structured tool turn remains after images are dropped.
+func flattenCurrentToolResults(payload *KiroPayload) {
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil {
+		return
+	}
+	narrated := narrateToolResults(cur.UserInputMessageContext.ToolResults, nil)
+	cur.Content = joinHistoryText(cur.Content, narrated)
+	cur.UserInputMessageContext.ToolResults = nil
+	if len(cur.UserInputMessageContext.Tools) == 0 {
+		cur.UserInputMessageContext = nil
 	}
 }
 
