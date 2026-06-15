@@ -96,7 +96,7 @@ func TestClaudeToKiroLongContextBudgetNotTruncated(t *testing.T) {
 	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB
 
 	msgs := []ClaudeMessage{{Role: "user", Content: "start the long task"}}
-	for i := 0; i < 800; i++ {
+	for i := 0; i < 230; i++ {
 		msgs = append(msgs,
 			ClaudeMessage{Role: "assistant", Content: "step result: " + big},
 			ClaudeMessage{Role: "user", Content: "next: " + big},

@@ -61,9 +61,9 @@ const maxPayloadBytes = 900 * 1024
 // token limits, not arbitrary request bodies, and JSON has serialization
 // overhead that the token estimator cannot see exactly.
 const longContextTokenThreshold = 250000
-const longContextBytesPerToken = 6
+const longContextBytesPerToken = 3
 const longContextPayloadHeadroomBytes = 256 * 1024
-const maxExpandedPayloadBytes = 12 * 1024 * 1024
+const maxExpandedPayloadBytes = 1100 * 1024
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
