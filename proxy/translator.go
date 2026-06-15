@@ -56,6 +56,15 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // leave room for headers and minor serialization overhead.
 const maxPayloadBytes = 900 * 1024
 
+// Long-context model payloads must be allowed to exceed the legacy 900KB
+// guardrail. The byte budget is still conservative because the upstream accepts
+// token limits, not arbitrary request bodies, and JSON has serialization
+// overhead that the token estimator cannot see exactly.
+const longContextTokenThreshold = 250000
+const longContextBytesPerToken = 6
+const longContextPayloadHeadroomBytes = 256 * 1024
+const maxExpandedPayloadBytes = 12 * 1024 * 1024
+
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
@@ -72,6 +81,25 @@ const imagesDroppedNote = "\n[Attached image(s) were omitted because the request
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
+
+type KiroConversionOptions struct {
+	MaxInputTokens int
+}
+
+func payloadByteLimitForMaxInputTokens(maxInputTokens int) int {
+	if maxInputTokens <= longContextTokenThreshold {
+		return maxPayloadBytes
+	}
+
+	limit := maxInputTokens*longContextBytesPerToken + longContextPayloadHeadroomBytes
+	if limit < maxPayloadBytes {
+		return maxPayloadBytes
+	}
+	if limit > maxExpandedPayloadBytes {
+		return maxExpandedPayloadBytes
+	}
+	return limit
+}
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -206,6 +234,10 @@ type ClaudeUsage struct {
 const maxToolDescLen = 10237
 
 func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+	return ClaudeToKiroWithOptions(req, thinking, KiroConversionOptions{})
+}
+
+func ClaudeToKiroWithOptions(req *ClaudeRequest, thinking bool, opts KiroConversionOptions) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -348,7 +380,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload, systemPrompt != "", payloadByteLimitForMaxInputTokens(opts.MaxInputTokens))
 
 	return payload
 }
@@ -1130,6 +1162,10 @@ type OpenAIUsage struct {
 // ==================== OpenAI -> Kiro 转换 ====================
 
 func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+	return OpenAIToKiroWithOptions(req, thinking, KiroConversionOptions{})
+}
+
+func OpenAIToKiroWithOptions(req *OpenAIRequest, thinking bool, opts KiroConversionOptions) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1332,7 +1368,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
+	truncatePayloadToLimit(payload, systemPrompt != "", payloadByteLimitForMaxInputTokens(opts.MaxInputTokens))
 
 	return payload
 }
@@ -1814,7 +1850,7 @@ func mergeUserTurns(last *KiroHistoryMessage, incoming KiroHistoryMessage) {
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits within maxPayloadBytes. It preserves, in order:
+// serialized payload fits within maxBytes. It preserves, in order:
 //   - the system priming pair (if present) at the front of history,
 //   - the most recent turns (at least minRecentHistoryTurns, and always the
 //     active tool turn that pairs with the current message),
@@ -1823,11 +1859,14 @@ func mergeUserTurns(last *KiroHistoryMessage, incoming KiroHistoryMessage) {
 // A single placeholder note (truncationPlaceholder) is inserted where older
 // turns were removed so the model is aware context was elided. hasPriming
 // indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool, maxBytes int) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	if maxBytes <= 0 {
+		maxBytes = maxPayloadBytes
+	}
+	if payloadByteSize(payload) <= maxBytes {
 		return
 	}
 
@@ -1869,7 +1908,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > maxBytes && kept > minRecentHistoryTurns {
 			break
 		}
 		keepFrom = i
@@ -1888,8 +1927,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	if payloadByteSize(payload) > maxBytes {
+		truncateCurrentMessage(payload, maxBytes)
 	}
 }
 
@@ -1932,12 +1971,12 @@ func currentMessageModelID(payload *KiroPayload) string {
 //  2. the structured tool-result text bodies (structure/pairing preserved),
 //  3. the attached images (dropped entirely, with the active tool turn flattened
 //     so the now-orphaned structured results don't break upstream pairing).
-func truncateCurrentMessage(payload *KiroPayload) {
+func truncateCurrentMessage(payload *KiroPayload, maxBytes int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 
 	// 1. Trim the plain text content to whatever budget the rest of the payload leaves.
 	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	budget := maxBytes - overhead
 	if budget < 0 {
 		budget = 0
 	}
@@ -1948,15 +1987,15 @@ func truncateCurrentMessage(payload *KiroPayload) {
 			cur.Content = cur.Content[:budget]
 		}
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	if payloadByteSize(payload) <= maxBytes {
 		return
 	}
 
 	// 2. Shrink structured tool-result text bodies. Keep the toolUseId/pairing so
 	//    the request stays well-formed; only the (potentially huge) text shrinks.
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
-		truncateToolResultsToLimit(payload)
-		if payloadByteSize(payload) <= maxPayloadBytes {
+		truncateToolResultsToLimit(payload, maxBytes)
+		if payloadByteSize(payload) <= maxBytes {
 			return
 		}
 	}
@@ -1973,12 +2012,12 @@ func truncateCurrentMessage(payload *KiroPayload) {
 		if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
 			flattenCurrentToolResults(payload)
 		}
-		if payloadByteSize(payload) <= maxPayloadBytes {
+		if payloadByteSize(payload) <= maxBytes {
 			return
 		}
 		// Re-trim text now that images are gone and the budget changed.
 		overhead = payloadByteSize(payload) - len(cur.Content)
-		budget = maxPayloadBytes - overhead
+		budget = maxBytes - overhead
 		if budget < 0 {
 			budget = 0
 		}
@@ -1996,14 +2035,14 @@ func truncateCurrentMessage(payload *KiroPayload) {
 // structured tool results so the serialized payload fits within maxPayloadBytes.
 // The toolUseId and result structure are preserved (pairing stays intact); only
 // the text content is trimmed, longest results first.
-func truncateToolResultsToLimit(payload *KiroPayload) {
+func truncateToolResultsToLimit(payload *KiroPayload, maxBytes int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 	if cur.UserInputMessageContext == nil {
 		return
 	}
 	results := cur.UserInputMessageContext.ToolResults
 
-	for payloadByteSize(payload) > maxPayloadBytes {
+	for payloadByteSize(payload) > maxBytes {
 		// Find the result with the largest text body.
 		largestIdx, largestContentIdx, largestLen := -1, -1, 0
 		for ri := range results {
@@ -2018,7 +2057,7 @@ func truncateToolResultsToLimit(payload *KiroPayload) {
 			return // nothing left to trim here
 		}
 
-		over := payloadByteSize(payload) - maxPayloadBytes
+		over := payloadByteSize(payload) - maxBytes
 		text := results[largestIdx].Content[largestContentIdx].Text
 		// Cut at least the overflow plus room for the note; keep going if needed.
 		cut := over + len(toolResultTruncatedNote)

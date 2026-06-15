@@ -108,7 +108,9 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	conversionOpts := h.conversionOptionsForModel(actualModel)
+	kiroPayload := OpenAIToKiroWithOptions(openaiReq, thinking, conversionOpts)
+	logLongContextPayloadBudget(actualModel, conversionOpts, kiroPayload)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()

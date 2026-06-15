@@ -89,6 +89,66 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 	}
 }
 
+// TestClaudeToKiroLongContextBudgetNotTruncated verifies that models whose
+// tokenLimits advertise a long context window are no longer forced through the
+// legacy 900KB request-body guardrail.
+func TestClaudeToKiroLongContextBudgetNotTruncated(t *testing.T) {
+	big := strings.Repeat("lorem ipsum dolor sit amet ", 80) // ~2.1KB
+
+	msgs := []ClaudeMessage{{Role: "user", Content: "start the long task"}}
+	for i := 0; i < 800; i++ {
+		msgs = append(msgs,
+			ClaudeMessage{Role: "assistant", Content: "step result: " + big},
+			ClaudeMessage{Role: "user", Content: "next: " + big},
+		)
+	}
+	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "FINAL: summarize everything above"})
+
+	req := &ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		System:   "You are a helpful assistant.",
+		Messages: msgs,
+	}
+
+	payload := ClaudeToKiroWithOptions(req, false, KiroConversionOptions{MaxInputTokens: 1000000})
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if len(raw) <= maxPayloadBytes {
+		t.Fatalf("expected long-context payload to exceed legacy limit, got %d <= %d", len(raw), maxPayloadBytes)
+	}
+	if len(raw) > payloadByteLimitForMaxInputTokens(1000000) {
+		t.Fatalf("payload size %d exceeds long-context byte budget", len(raw))
+	}
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
+			t.Fatalf("long-context payload should not be truncated")
+		}
+	}
+}
+
+func TestFallbackMaxInputTokensForOpusLongContextModels(t *testing.T) {
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"claude-opus-4.5", 0},
+		{"claude-opus-4.6", 1000000},
+		{"claude-opus-4.7", 1000000},
+		{"claude-opus-4.8", 1000000},
+		{"claude-sonnet-4.6", 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := fallbackMaxInputTokensForModel(tc.model); got != tc.want {
+				t.Fatalf("fallbackMaxInputTokensForModel(%q) = %d, want %d", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestClaudeToKiroTruncatesOversizedCurrentToolResult covers the case where the
 // active tool turn's result is itself larger than the upstream input limit (e.g.
 // reading a huge file). The structured tool result must be shrunk below

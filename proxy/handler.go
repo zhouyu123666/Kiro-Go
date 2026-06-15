@@ -9,6 +9,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -500,6 +501,8 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.7", "anthropic", true),
 		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("claude-opus-4.8", "anthropic", true),
+		buildModelInfo("claude-opus-4.8"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4", "anthropic", true),
@@ -519,6 +522,85 @@ func modelSupportsImage(inputTypes []string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) conversionOptionsForModel(model string) KiroConversionOptions {
+	maxInputTokens := h.maxInputTokensForModel(model)
+	return KiroConversionOptions{
+		MaxInputTokens: maxInputTokens,
+	}
+}
+
+func (h *Handler) maxInputTokensForModel(model string) int {
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		return 0
+	}
+
+	h.modelsCacheMu.RLock()
+	defer h.modelsCacheMu.RUnlock()
+	for _, m := range h.cachedModels {
+		if strings.ToLower(strings.TrimSpace(m.ModelId)) != key {
+			continue
+		}
+		if m.TokenLimits != nil {
+			return m.TokenLimits.MaxInputTokens
+		}
+		return fallbackMaxInputTokensForModel(key)
+	}
+	return fallbackMaxInputTokensForModel(key)
+}
+
+func fallbackMaxInputTokensForModel(model string) int {
+	if isClaudeOpusAtLeast(model, 4, 6) {
+		return 1000000
+	}
+	return 0
+}
+
+func isClaudeOpusAtLeast(model string, minMajor, minMinor int) bool {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(model)), "-")
+	if len(parts) < 3 || parts[0] != "claude" || parts[1] != "opus" {
+		return false
+	}
+
+	versionParts := strings.Split(parts[2], ".")
+	major, err := strconv.Atoi(versionParts[0])
+	if err != nil {
+		return false
+	}
+
+	minor := 0
+	if len(versionParts) > 1 {
+		minor, err = strconv.Atoi(versionParts[1])
+		if err != nil {
+			return false
+		}
+	}
+
+	if major != minMajor {
+		return major > minMajor
+	}
+	return minor >= minMinor
+}
+
+func logLongContextPayloadBudget(model string, opts KiroConversionOptions, payload *KiroPayload) {
+	if opts.MaxInputTokens <= longContextTokenThreshold || payload == nil {
+		return
+	}
+
+	size := payloadByteSize(payload)
+	if size <= maxPayloadBytes {
+		return
+	}
+
+	logger.Infof("[PayloadLimit] model=%s maxInputTokens=%d payloadBytes=%d byteLimit=%d legacyByteLimit=%d",
+		model,
+		opts.MaxInputTokens,
+		size,
+		payloadByteLimitForMaxInputTokens(opts.MaxInputTokens),
+		maxPayloadBytes,
+	)
 }
 
 func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
@@ -813,7 +895,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	conversionOpts := h.conversionOptionsForModel(req.Model)
+	kiroPayload := ClaudeToKiroWithOptions(&req, thinking, conversionOpts)
+	logLongContextPayloadBudget(req.Model, conversionOpts, kiroPayload)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -1507,7 +1591,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	conversionOpts := h.conversionOptionsForModel(req.Model)
+	kiroPayload := OpenAIToKiroWithOptions(&req, thinking, conversionOpts)
+	logLongContextPayloadBudget(req.Model, conversionOpts, kiroPayload)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -3130,7 +3216,9 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	conversionOpts := h.conversionOptionsForModel(actualModel)
+	kiroPayload := OpenAIToKiroWithOptions(openaiReq, thinking, conversionOpts)
+	logLongContextPayloadBudget(actualModel, conversionOpts, kiroPayload)
 
 	var content string
 	callback := &KiroStreamCallback{
