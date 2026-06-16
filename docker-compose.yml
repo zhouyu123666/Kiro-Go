@@ -1,12 +1,24 @@
-version: '3.8'
+version: "3.8"
 
 services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
+      - "8088:8080"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # 日志级别: debug < info < warn < error，默认 info。
+      # 排查问题时设为 debug 可看到最详细的日志（如截断、上游请求细节）。
+      - LOG_LEVEL=debug
+      # 让日志时间戳用本地时区，便于和外部系统对照（容器默认 UTC）。
+      - TZ=Asia/Shanghai
     restart: unless-stopped
+    # 日志走 stdout/stderr。配置 json-file 驱动并轮转，避免日志无限增长，
+    # 同时保证容器重建前的历史日志可通过 `docker compose logs` 查到。
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
