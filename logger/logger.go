@@ -14,7 +14,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -35,6 +37,11 @@ var (
 	infoLog  = log.New(os.Stdout, "INFO  ", log.LstdFlags)
 	warnLog  = log.New(os.Stderr, "WARN  ", log.LstdFlags)
 	errorLog = log.New(os.Stderr, "ERROR ", log.LstdFlags)
+
+	// fileWriter, when non-nil, is the rotating file all levels additionally
+	// write to (in tandem with stdout/stderr). Guarded by fileMu.
+	fileMu     sync.Mutex
+	fileWriter *rotatingFile
 )
 
 func init() {
@@ -100,6 +107,34 @@ func Init(fallback string) {
 	if l, ok := ParseLevel(value); ok {
 		SetLevel(l)
 	}
+}
+
+// EnableFileOutput additionally writes all log levels to a rotating file at
+// path (e.g. "data/logs/kiro-go.log"), in tandem with stdout/stderr. The parent
+// directory is created if needed. maxSizeMB caps a single file before rotation;
+// maxBackups caps how many rotated files are retained. Safe to call once at
+// startup; calling again replaces the previous file target.
+func EnableFileOutput(path string, maxSizeMB, maxBackups int) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	rf, err := newRotatingFile(dir, base, int64(maxSizeMB)*1024*1024, maxBackups)
+	if err != nil {
+		return err
+	}
+
+	fileMu.Lock()
+	if fileWriter != nil {
+		_ = fileWriter.Close()
+	}
+	fileWriter = rf
+	fileMu.Unlock()
+
+	// Tee each level to its original console stream plus the file.
+	debugLog.SetOutput(io.MultiWriter(os.Stdout, rf))
+	infoLog.SetOutput(io.MultiWriter(os.Stdout, rf))
+	warnLog.SetOutput(io.MultiWriter(os.Stderr, rf))
+	errorLog.SetOutput(io.MultiWriter(os.Stderr, rf))
+	return nil
 }
 
 func enabled(l Level) bool {

@@ -23,8 +23,21 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// envInt reads an integer environment variable, falling back to def when unset
+// or unparseable.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n
+		}
+	}
+	return def
+}
 
 func main() {
 	// 配置文件路径，支持环境变量覆盖
@@ -45,6 +58,23 @@ func main() {
 
 	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
 	logger.Init(config.GetLogLevel())
+
+	// Additionally tee logs to a rotating file under the data directory so history
+	// survives container restarts and is grep-able. Disable by setting
+	// LOG_FILE_ENABLED=false. Path/size/backups are overridable via env.
+	if !strings.EqualFold(os.Getenv("LOG_FILE_ENABLED"), "false") {
+		logPath := os.Getenv("LOG_FILE_PATH")
+		if logPath == "" {
+			logPath = filepath.Join(filepath.Dir(configPath), "logs", "kiro-go.log")
+		}
+		maxSizeMB := envInt("LOG_FILE_MAX_SIZE_MB", 50)
+		maxBackups := envInt("LOG_FILE_MAX_BACKUPS", 5)
+		if err := logger.EnableFileOutput(logPath, maxSizeMB, maxBackups); err != nil {
+			logger.Warnf("Failed to enable file logging at %s: %v (continuing with console only)", logPath, err)
+		} else {
+			logger.Infof("File logging enabled: %s (max %dMB x %d files)", logPath, maxSizeMB, maxBackups)
+		}
+	}
 
 	// 环境变量覆盖密码
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
