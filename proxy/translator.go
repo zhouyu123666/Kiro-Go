@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -1723,11 +1724,34 @@ func currentMessageModelID(payload *KiroPayload) string {
 	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
 }
 
-// truncateCurrentMessage hard-truncates the current message content as a last
-// resort when even the minimal retained history plus current message exceeds the
-// limit.
+// truncateCurrentMessage hard-truncates the current message as a last resort
+// when even the minimal retained history plus current message exceeds the limit.
+//
+// The current message can be oversized for three independent reasons: large text
+// Content, large base64 Images, or large structured ToolResults. Shrinking only
+// Content (the previous behavior) silently failed whenever the bulk lived in
+// Images or ToolResults — overhead alone exceeded maxPayloadBytes, Content was
+// clamped to "." yet the payload stayed over-limit and upstream returned HTTP 400.
+//
+// We now trim in order of least to most semantically important: first drop
+// images (heaviest, least recoverable), then shrink tool-result text, and only
+// then shrink Content. All string trims are UTF-8 boundary-safe so the resulting
+// JSON never contains a split multi-byte rune.
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+
+	// 1) Drop images first — base64 bytes are large and cannot be partially kept.
+	if len(cur.Images) > 0 && payloadByteSize(payload) > maxPayloadBytes {
+		cur.Images = nil
+	}
+
+	// 2) Shrink structured tool-result text if the payload is still too large.
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		shrinkToolResultsToLimit(payload)
+	}
+
+	// 3) Finally shrink Content. Recompute overhead each time since steps 1-2
+	//    changed the payload size.
 	overhead := payloadByteSize(payload) - len(cur.Content)
 	budget := maxPayloadBytes - overhead
 	if budget < 0 {
@@ -1738,8 +1762,60 @@ func truncateCurrentMessage(payload *KiroPayload) {
 			cur.Content = minimalFallbackUserContent
 			return
 		}
-		cur.Content = cur.Content[:budget]
+		cur.Content = truncateUTF8(cur.Content, budget)
 	}
+}
+
+// shrinkToolResultsToLimit reduces the serialized size of the current message's
+// tool results until the whole payload fits. It trims each result's text content
+// proportionally, then clears it entirely if that is still not enough, always
+// respecting UTF-8 boundaries.
+func shrinkToolResultsToLimit(payload *KiroPayload) {
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil {
+		return
+	}
+	results := cur.UserInputMessageContext.ToolResults
+
+	for i := range results {
+		if payloadByteSize(payload) <= maxPayloadBytes {
+			return
+		}
+		for j := range results[i].Content {
+			text := results[i].Content[j].Text
+			if text == "" {
+				continue
+			}
+			overhead := payloadByteSize(payload) - len(text)
+			budget := maxPayloadBytes - overhead
+			if budget <= 0 {
+				results[i].Content[j].Text = ""
+				continue
+			}
+			if len(text) > budget {
+				results[i].Content[j].Text = truncateUTF8(text, budget)
+			}
+		}
+	}
+}
+
+// truncateUTF8 returns the longest prefix of s whose byte length is <= maxBytes
+// without splitting a multi-byte rune. Slicing a Go string at an arbitrary byte
+// index can land mid-rune, producing invalid UTF-8 that json.Marshal escapes
+// into a replacement character — or, worse, that upstream rejects as malformed.
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	// Walk back to the start of the rune that straddles the cut point.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {
