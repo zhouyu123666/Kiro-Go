@@ -2064,6 +2064,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
+	case path == "/accounts/usage" && r.Method == "GET":
+		h.apiGetAccountUsage(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
@@ -2222,6 +2224,74 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	json.NewEncoder(w).Encode(result)
+}
+
+type accountUsageView struct {
+	ID                   string  `json:"id"`
+	Email                string  `json:"email,omitempty"`
+	UserId               string  `json:"userId,omitempty"`
+	Nickname             string  `json:"nickname,omitempty"`
+	Enabled              bool    `json:"enabled"`
+	SubscriptionType     string  `json:"subscriptionType,omitempty"`
+	SubscriptionTitle    string  `json:"subscriptionTitle,omitempty"`
+	UsageCurrent         float64 `json:"usageCurrent"`
+	UsageLimit           float64 `json:"usageLimit"`
+	UsagePercent         float64 `json:"usagePercent"`
+	UsagePercentage      float64 `json:"usagePercentage"`
+	NextResetDate        string  `json:"nextResetDate,omitempty"`
+	LastRefresh          int64   `json:"lastRefresh,omitempty"`
+	TrialUsageCurrent    float64 `json:"trialUsageCurrent,omitempty"`
+	TrialUsageLimit      float64 `json:"trialUsageLimit,omitempty"`
+	TrialUsagePercent    float64 `json:"trialUsagePercent,omitempty"`
+	TrialUsagePercentage float64 `json:"trialUsagePercentage,omitempty"`
+	TrialStatus          string  `json:"trialStatus,omitempty"`
+	TrialExpiresAt       int64   `json:"trialExpiresAt,omitempty"`
+}
+
+func usageFraction(current, limit, stored float64) float64 {
+	if limit > 0 {
+		pct := current / limit
+		if pct < 0 {
+			return 0
+		}
+		return pct
+	}
+	if stored < 0 {
+		return 0
+	}
+	return stored
+}
+
+// apiGetAccountUsage returns a compact account quota summary from config.json.
+func (h *Handler) apiGetAccountUsage(w http.ResponseWriter, r *http.Request) {
+	accounts := config.GetAccounts()
+	result := make([]accountUsageView, len(accounts))
+	for i, a := range accounts {
+		usagePercent := usageFraction(a.UsageCurrent, a.UsageLimit, a.UsagePercent)
+		trialUsagePercent := usageFraction(a.TrialUsageCurrent, a.TrialUsageLimit, a.TrialUsagePercent)
+		result[i] = accountUsageView{
+			ID:                   a.ID,
+			Email:                a.Email,
+			UserId:               a.UserId,
+			Nickname:             a.Nickname,
+			Enabled:              a.Enabled,
+			SubscriptionType:     a.SubscriptionType,
+			SubscriptionTitle:    a.SubscriptionTitle,
+			UsageCurrent:         a.UsageCurrent,
+			UsageLimit:           a.UsageLimit,
+			UsagePercent:         usagePercent,
+			UsagePercentage:      usagePercent * 100,
+			NextResetDate:        a.NextResetDate,
+			LastRefresh:          a.LastRefresh,
+			TrialUsageCurrent:    a.TrialUsageCurrent,
+			TrialUsageLimit:      a.TrialUsageLimit,
+			TrialUsagePercent:    trialUsagePercent,
+			TrialUsagePercentage: trialUsagePercent * 100,
+			TrialStatus:          a.TrialStatus,
+			TrialExpiresAt:       a.TrialExpiresAt,
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"accounts": result})
 }
 
 func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
