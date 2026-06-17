@@ -554,12 +554,11 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("orphaned current tool_result should be flattened, got %#v", cur.UserInputMessageContext.ToolResults)
 	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected original tool text preserved in flattened content, got %q", cur.Content)
 	}
 }
 
@@ -626,8 +625,10 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage == nil {
+			continue
+		}
+		if strings.Contains(h.UserInputMessage.Content, "Tool results:") {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}

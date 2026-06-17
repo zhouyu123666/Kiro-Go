@@ -153,6 +153,88 @@ func TestTruncateCurrentMessageShrinksOversizedToolResults(t *testing.T) {
 	}
 }
 
+// TestTruncatePayloadPreservesActiveToolUsePairWhenCurrentMessageOversized
+// covers the boundary that made clients lose tool-call state: when the payload is
+// oversized mainly because the current tool_result is large, history may contain
+// only the matching assistant tool_use. The truncation path must not drop that
+// leading assistant turn, otherwise the current tool_result becomes orphaned.
+func TestTruncatePayloadPreservesActiveToolUsePairWhenCurrentMessageOversized(t *testing.T) {
+	bigText := strings.Repeat("x", maxPayloadBytes+50*1024)
+
+	payload := &KiroPayload{}
+	payload.ConversationState.History = []KiroHistoryMessage{
+		{
+			AssistantResponseMessage: &KiroAssistantResponseMessage{
+				ToolUses: []KiroToolUse{{
+					ToolUseID: "tool-1",
+					Name:      "exec_command",
+					Input:     map[string]interface{}{"cmd": "build"},
+				}},
+			},
+		},
+	}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "Tool results:",
+		ModelID: "claude-opus-4.8",
+		Origin:  "AI_EDITOR",
+		UserInputMessageContext: &UserInputMessageContext{
+			ToolResults: []KiroToolResult{
+				{
+					ToolUseID: "tool-1",
+					Status:    "success",
+					Content:   []KiroResultContent{{Text: bigText}},
+				},
+			},
+		},
+	}
+
+	truncatePayloadToLimit(payload, false)
+
+	if got := payloadByteSize(payload); got > maxPayloadBytes {
+		t.Fatalf("payload size %d still exceeds limit %d after truncation", got, maxPayloadBytes)
+	}
+	hist := payload.ConversationState.History
+	if len(hist) != 1 || hist[0].AssistantResponseMessage == nil || len(hist[0].AssistantResponseMessage.ToolUses) != 1 {
+		t.Fatalf("expected active assistant tool_use to be preserved, got %#v", hist)
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) != 1 || ctx.ToolResults[0].ToolUseID != "tool-1" {
+		t.Fatalf("expected current tool_result to stay paired, got %#v", ctx)
+	}
+}
+
+func TestRepairCurrentToolResultPairingFlattensOrphanedCurrentResult(t *testing.T) {
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "Tool results:",
+		ModelID: "claude-opus-4.8",
+		Origin:  "AI_EDITOR",
+		UserInputMessageContext: &UserInputMessageContext{
+			Tools: []KiroToolWrapper{{}},
+			ToolResults: []KiroToolResult{
+				{
+					ToolUseID: "missing-tool-use",
+					Status:    "success",
+					Content:   []KiroResultContent{{Text: "build ok"}},
+				},
+			},
+		},
+	}
+
+	repairCurrentToolResultPairing(payload)
+
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(cur.Content, "Tool results:") {
+		t.Fatalf("expected orphaned tool result to be narrated into content, got %q", cur.Content)
+	}
+	if cur.UserInputMessageContext == nil {
+		t.Fatalf("expected tool specs to remain in context")
+	}
+	if len(cur.UserInputMessageContext.ToolResults) != 0 {
+		t.Fatalf("expected orphaned structured tool results to be cleared")
+	}
+}
+
 // TestTruncateUTF8RespectsRuneBoundaries verifies that shrinking never splits a
 // multi-byte rune, which would otherwise yield invalid UTF-8 that upstream
 // rejects as a malformed request.

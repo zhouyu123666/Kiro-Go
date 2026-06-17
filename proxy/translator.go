@@ -288,7 +288,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 构建最终内容
 	finalContent := ""
-	if currentContent != "" {
+	if len(currentToolResults) > 0 && !keepCurrentToolResults {
+		finalContent = joinHistoryText(currentContent, buildToolResultsContinuation(currentToolResults))
+	} else if currentContent != "" {
 		finalContent = currentContent
 	} else if len(currentImages) > 0 {
 		finalContent = normalizeUserContent("", true)
@@ -1234,13 +1236,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := currentContent
 	if finalContent == "" {
-		if len(currentImages) > 0 {
+		if len(currentToolResults) > 0 && !keepCurrentToolResults {
+			finalContent = buildToolResultsContinuation(currentToolResults)
+		} else if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
 			finalContent = minimalFallbackUserContent
 		}
+	}
+	if len(currentToolResults) > 0 && !keepCurrentToolResults && currentContent != "" {
+		finalContent = joinHistoryText(currentContent, buildToolResultsContinuation(currentToolResults))
 	}
 
 	// 转换工具
@@ -1674,8 +1681,11 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 		keepFrom = i
 	}
 
+	currentToolResultIDs := currentMessageToolResultIDs(payload)
 	tail := conversation[keepFrom:]
-	tail = dropLeadingAssistant(tail)
+	if keepFrom > 0 {
+		tail = dropLeadingAssistantUnlessActive(tail, currentToolResultIDs)
+	}
 
 	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
 	rebuilt = append(rebuilt, priming...)
@@ -1684,6 +1694,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	}
 	rebuilt = append(rebuilt, tail...)
 	payload.ConversationState.History = rebuilt
+	repairCurrentToolResultPairing(payload)
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
@@ -1702,13 +1713,70 @@ func historyEntryByteSize(entry KiroHistoryMessage) int {
 	return len(raw) + 1
 }
 
-// dropLeadingAssistant removes a leading assistant message from a history tail so
-// it does not directly follow the placeholder user turn with a broken pairing.
-func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
+// dropLeadingAssistantUnlessActive removes leading assistant messages from a
+// truncated history tail unless the first assistant is the active tool-use turn
+// answered by the current message's toolResults. Dropping that active assistant
+// leaves orphaned current toolResults, which causes the next turn to lose tool
+// state.
+func dropLeadingAssistantUnlessActive(tail []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
 	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
+		if assistantToolUsesCoveredByIDs(tail[0], currentToolResultIDs) {
+			break
+		}
 		tail = tail[1:]
 	}
 	return tail
+}
+
+func currentMessageToolResultIDs(payload *KiroPayload) map[string]bool {
+	if payload == nil {
+		return nil
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil {
+		return nil
+	}
+	return collectToolResultIDs(ctx.ToolResults)
+}
+
+func assistantToolUsesCoveredByIDs(msg KiroHistoryMessage, ids map[string]bool) bool {
+	if len(ids) == 0 || msg.AssistantResponseMessage == nil || len(msg.AssistantResponseMessage.ToolUses) == 0 {
+		return false
+	}
+	for _, tu := range msg.AssistantResponseMessage.ToolUses {
+		if !ids[tu.ToolUseID] {
+			return false
+		}
+	}
+	return true
+}
+
+func repairCurrentToolResultPairing(payload *KiroPayload) {
+	if payload == nil {
+		return
+	}
+	ids := currentMessageToolResultIDs(payload)
+	if len(ids) == 0 {
+		return
+	}
+	if currentToolResultsMatchLastAssistant(payload.ConversationState.History, ids) {
+		return
+	}
+
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	ctx := cur.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) == 0 {
+		return
+	}
+
+	narrated := buildToolResultsContinuation(ctx.ToolResults)
+	if strings.TrimSpace(narrated) != "" && !strings.Contains(cur.Content, toolResultsContinuationPrefix) {
+		cur.Content = joinHistoryText(cur.Content, narrated)
+	}
+	ctx.ToolResults = nil
+	if len(ctx.Tools) == 0 {
+		cur.UserInputMessageContext = nil
+	}
 }
 
 // payloadByteSize returns the serialized size of the payload in bytes.

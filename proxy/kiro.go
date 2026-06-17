@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -239,6 +240,13 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+
+	// RequireCompletionSignal makes parseEventStream reject a clean EOF after
+	// assistant text unless the stream also carried terminal metadata. Real Kiro
+	// responses are streamed with unknown length; without this guard an upstream
+	// FIN after partial text is indistinguishable from a completed turn to the
+	// Claude/OpenAI clients.
+	RequireCompletionSignal bool
 }
 
 // ==================== API Call ====================
@@ -392,7 +400,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		streamCallback := callback
+		if resp.ContentLength < 0 && callback != nil && !callback.RequireCompletionSignal {
+			wrapped := *callback
+			wrapped.RequireCompletionSignal = true
+			streamCallback = &wrapped
+		}
+		err = parseEventStream(resp.Body, streamCallback)
 		resp.Body.Close()
 		return err
 	}
@@ -404,6 +418,16 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 }
 
 // ==================== Event Stream Parsing ====================
+
+var errKiroStreamIncomplete = errors.New("kiro event stream ended before completion")
+
+type eventStreamHeaders struct {
+	MessageType   string
+	EventType     string
+	ExceptionType string
+	ErrorCode     string
+	ErrorMessage  string
+}
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
@@ -417,23 +441,33 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	var framesRead int
+	var sawAssistantText bool
+	var sawToolUse bool
+	var sawCompletionSignalAfterText bool
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
+			if framesRead == 0 {
+				return fmt.Errorf("%w: no event frames received", errKiroStreamIncomplete)
+			}
+			if callback.RequireCompletionSignal && sawAssistantText && !sawCompletionSignalAfterText && !sawToolUse {
+				return fmt.Errorf("%w: missing terminal metadata", errKiroStreamIncomplete)
+			}
 			break
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: reading event prelude: %v", errKiroStreamIncomplete, err)
 		}
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
 
 		if totalLength < 16 {
-			continue
+			return fmt.Errorf("malformed event stream frame: total length %d is too small", totalLength)
 		}
 
 		// Read the remaining message bytes.
@@ -441,30 +475,43 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: reading event frame: %v", errKiroStreamIncomplete, err)
 		}
+		framesRead++
 
 		if headersLength > len(msgBuf)-4 {
-			continue
+			return fmt.Errorf("malformed event stream frame: headers length %d exceeds frame body %d", headersLength, len(msgBuf)-4)
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		headers := parseEventStreamHeaders(msgBuf[0:headersLength])
+		if headers.MessageType == "" {
+			headers.MessageType = "event"
+		}
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
-		if len(payloadBytes) == 0 {
+		if headers.MessageType == "error" || headers.MessageType == "exception" {
+			return eventStreamMessageError(headers, payloadBytes)
+		}
+		if headers.MessageType != "event" {
 			continue
 		}
 
 		var event map[string]interface{}
-		if err := json.Unmarshal(payloadBytes, &event); err != nil {
-			continue
+		if len(payloadBytes) > 0 {
+			if err := json.Unmarshal(payloadBytes, &event); err != nil {
+				return fmt.Errorf("malformed event stream payload for %s: %w", headers.EventType, err)
+			}
+		} else {
+			event = make(map[string]interface{})
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		eventIsCompletionSignal := isEventStreamCompletionSignal(headers.EventType, event)
 
 		// Dispatch by event type.
-		switch eventType {
+		switch headers.EventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				sawAssistantText = true
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
@@ -478,6 +525,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				}
 			}
 		case "toolUseEvent":
+			sawToolUse = true
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -489,6 +537,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 					callback.OnContextUsage(pct)
 				}
 			}
+		}
+		if eventIsCompletionSignal && sawAssistantText {
+			sawCompletionSignalAfterText = true
 		}
 	}
 
@@ -504,6 +555,78 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
 	return nil
+}
+
+func parseEventStreamHeaders(headers []byte) eventStreamHeaders {
+	values := extractEventStreamStringHeaders(headers)
+	return eventStreamHeaders{
+		MessageType:   values[":message-type"],
+		EventType:     values[":event-type"],
+		ExceptionType: values[":exception-type"],
+		ErrorCode:     values[":error-code"],
+		ErrorMessage:  values[":error-message"],
+	}
+}
+
+func eventStreamMessageError(headers eventStreamHeaders, payload []byte) error {
+	kind := headers.MessageType
+	code := headers.ErrorCode
+	if kind == "exception" && headers.ExceptionType != "" {
+		code = headers.ExceptionType
+	}
+	if code == "" {
+		code = "unknown"
+	}
+
+	message := strings.TrimSpace(headers.ErrorMessage)
+	if message == "" && len(payload) > 0 {
+		message = strings.TrimSpace(string(payload))
+		var decoded map[string]interface{}
+		if err := json.Unmarshal(payload, &decoded); err == nil {
+			for _, key := range []string{"message", "Message", "errorMessage", "error"} {
+				if v, ok := decoded[key].(string); ok && strings.TrimSpace(v) != "" {
+					message = strings.TrimSpace(v)
+					break
+				}
+			}
+		}
+	}
+	if message == "" {
+		message = "upstream event stream error"
+	}
+	return fmt.Errorf("kiro event stream %s %s: %s", kind, code, message)
+}
+
+func isEventStreamCompletionSignal(eventType string, event map[string]interface{}) bool {
+	switch eventType {
+	case "meteringEvent", "contextUsageEvent", "assistantResponseMetadataEvent", "messageMetadataEvent":
+		return true
+	}
+
+	lowerEventType := strings.ToLower(eventType)
+	if strings.Contains(lowerEventType, "complete") || strings.Contains(lowerEventType, "metadata") {
+		return true
+	}
+
+	for _, key := range []string{
+		"stopReason", "stop_reason", "finishReason", "finish_reason",
+		"completionReason", "completion_reason",
+	} {
+		if v, ok := event[key].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+
+	for _, key := range []string{
+		"done", "isDone", "complete", "completed", "isComplete",
+		"final", "isFinal", "end", "isEnd",
+	} {
+		if v, ok := event[key].(bool); ok && v {
+			return true
+		}
+	}
+
+	return false
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -789,6 +912,11 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.
 func extractEventType(headers []byte) string {
+	return extractEventStreamStringHeaders(headers)[":event-type"]
+}
+
+func extractEventStreamStringHeaders(headers []byte) map[string]string {
+	values := make(map[string]string)
 	offset := 0
 	for offset < len(headers) {
 		if offset >= len(headers) {
@@ -818,9 +946,7 @@ func extractEventType(headers []byte) string {
 			}
 			value := string(headers[offset : offset+valueLen])
 			offset += valueLen
-			if name == ":event-type" {
-				return value
-			}
+			values[name] = value
 			continue
 		}
 
@@ -838,5 +964,5 @@ func extractEventType(headers []byte) string {
 			break
 		}
 	}
-	return ""
+	return values
 }

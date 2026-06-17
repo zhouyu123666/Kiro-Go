@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,6 +106,68 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
+	}
+}
+
+func TestParseEventStreamRequiresCompletionSignalAfterAssistantText(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "partial response",
+	}))
+
+	var completed bool
+	err := parseEventStream(stream, &KiroStreamCallback{
+		RequireCompletionSignal: true,
+		OnComplete: func(_, _ int) {
+			completed = true
+		},
+	})
+	if !errors.Is(err, errKiroStreamIncomplete) {
+		t.Fatalf("expected incomplete stream error, got %v", err)
+	}
+	if completed {
+		t.Fatalf("incomplete stream must not call OnComplete")
+	}
+}
+
+func TestParseEventStreamAllowsCompletionSignalAfterAssistantText(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "complete response"}),
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 10.0}),
+	}, nil))
+
+	if err := parseEventStream(stream, &KiroStreamCallback{RequireCompletionSignal: true}); err != nil {
+		t.Fatalf("expected completed stream, got %v", err)
+	}
+}
+
+func TestParseEventStreamRequiresCompletionSignalAfterTextOrder(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 10.0}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial response"}),
+	}, nil))
+
+	err := parseEventStream(stream, &KiroStreamCallback{RequireCompletionSignal: true})
+	if !errors.Is(err, errKiroStreamIncomplete) {
+		t.Fatalf("expected incomplete stream error when terminal metadata precedes text, got %v", err)
+	}
+}
+
+func TestParseEventStreamReturnsErrorForExceptionFrame(t *testing.T) {
+	payload, err := json.Marshal(map[string]interface{}{"message": "upstream exploded"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	stream := bytes.NewReader(awsEventStreamFrameWithHeaders(t, map[string]string{
+		":message-type":   "exception",
+		":exception-type": "InternalFailure",
+	}, payload))
+
+	err = parseEventStream(stream, &KiroStreamCallback{})
+	if err == nil {
+		t.Fatalf("expected exception frame to return an error")
+	}
+	if got := err.Error(); !strings.Contains(got, "InternalFailure") || !strings.Contains(got, "upstream exploded") {
+		t.Fatalf("unexpected exception error: %v", err)
 	}
 }
 
@@ -252,13 +316,22 @@ func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]inte
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	headerValue := []byte(eventType)
-	headers := make([]byte, 0, 1+len(":event-type")+1+2+len(headerValue))
-	headers = append(headers, byte(len(":event-type")))
-	headers = append(headers, []byte(":event-type")...)
-	headers = append(headers, byte(7))
-	headers = append(headers, byte(len(headerValue)>>8), byte(len(headerValue)))
-	headers = append(headers, headerValue...)
+	return awsEventStreamFrameWithHeaders(t, map[string]string{":event-type": eventType}, payloadBytes)
+}
+
+func awsEventStreamFrameWithHeaders(t *testing.T, headerValues map[string]string, payloadBytes []byte) []byte {
+	t.Helper()
+
+	var headers []byte
+	for name, value := range headerValues {
+		headerName := []byte(name)
+		headerValue := []byte(value)
+		headers = append(headers, byte(len(headerName)))
+		headers = append(headers, headerName...)
+		headers = append(headers, byte(7))
+		headers = append(headers, byte(len(headerValue)>>8), byte(len(headerValue)))
+		headers = append(headers, headerValue...)
+	}
 
 	totalLength := 12 + len(headers) + len(payloadBytes) + 4
 	frame := make([]byte, 12, totalLength)
