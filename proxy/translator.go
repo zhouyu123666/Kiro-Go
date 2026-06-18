@@ -807,7 +807,31 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
 		result = append(result, w)
 	}
-	return result, nameMap
+	return dedupeToolWrappers(result), nameMap
+}
+
+// dedupeToolWrappers removes wrappers whose sanitized tool name already appeared.
+// Kiro rejects a tools array containing two specs with the same name
+// ("TOOL_DUPLICATE"). Clients that aggregate multiple MCP servers (e.g. new-api)
+// can emit the same tool twice, or two distinct original names that collapse to
+// one name after sanitizeToolName/shortenToolName. We keep the first occurrence
+// of each final name and drop later collisions; the surviving spec keeps the
+// ToolNameMap entry so tool_use responses still map back to the client name.
+func dedupeToolWrappers(wrappers []KiroToolWrapper) []KiroToolWrapper {
+	if len(wrappers) <= 1 {
+		return wrappers
+	}
+	seen := make(map[string]bool, len(wrappers))
+	result := make([]KiroToolWrapper, 0, len(wrappers))
+	for _, w := range wrappers {
+		name := w.ToolSpecification.Name
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		result = append(result, w)
+	}
+	return result
 }
 
 // synthesizeToolSpecsForActiveTurn builds minimal tool specifications for the
@@ -2210,7 +2234,7 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 		wrapper.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.Function.Parameters)}
 		result = append(result, wrapper)
 	}
-	return result
+	return dedupeToolWrappers(result)
 }
 
 // ==================== Kiro -> OpenAI 转换 ====================
