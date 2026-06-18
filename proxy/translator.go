@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"kiro-go/config"
 	"regexp"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/ledongthuc/pdf"
 )
 
 // modelAliases lists model names that need an explicit redirect — dated snapshots,
@@ -39,6 +42,37 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
+var documentNameExtensionPattern = regexp.MustCompile(`\.[^.]+$`)
+var documentNameUnsafePattern = regexp.MustCompile(`[^a-zA-Z0-9\s\-()[\]]`)
+var documentNameRepeatedHyphenPattern = regexp.MustCompile(`-{2,}`)
+var documentNameRepeatedSpacePattern = regexp.MustCompile(`\s{2,}`)
+
+var kiroDocumentFormatsByMime = map[string]string{
+	"application/pdf":    "pdf",
+	"text/csv":           "csv",
+	"application/msword": "doc",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+	"application/vnd.ms-excel": "xls",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+	"text/html":     "html",
+	"text/plain":    "txt",
+	"text/markdown": "md",
+}
+
+var kiroDocumentFormatsByExtension = map[string]string{
+	"pdf":      "pdf",
+	"csv":      "csv",
+	"doc":      "doc",
+	"docx":     "docx",
+	"xls":      "xls",
+	"xlsx":     "xlsx",
+	"html":     "html",
+	"htm":      "html",
+	"txt":      "txt",
+	"md":       "md",
+	"markdown": "md",
+}
+
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
@@ -46,6 +80,14 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
+const toolResultDocumentPlaceholder = "[Tool returned a document; the document is attached to this message.]"
+const maxKiroDocuments = 5
+
+// maxInlinedPDFTextBytes caps the text extracted from a single PDF that gets
+// inlined into the message. The Kiro cloud accepts the documents field but does
+// not surface PDF bytes to the model, so we extract text locally and inline it.
+// This cap keeps a runaway PDF from blowing past the payload size limit.
+const maxInlinedPDFTextBytes = 60 * 1024
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
 // Kiro's upstream rejects oversized requests with HTTP 400
@@ -208,18 +250,21 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	history := make([]KiroHistoryMessage, 0)
 	var currentContent string
 	var currentImages []KiroImage
+	var currentDocuments []KiroDocument
 	var currentToolResults []KiroToolResult
 
 	for i, msg := range req.Messages {
 		isLast := i == len(req.Messages)-1
 
 		if msg.Role == "user" {
-			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			content, images, documents, toolResults := extractClaudeUserContent(msg.Content)
+			content, documents = inlinePDFDocuments(content, documents)
+			content = normalizeUserContent(content, len(images) > 0, len(documents) > 0)
 
 			if isLast {
 				currentContent = content
 				currentImages = images
+				currentDocuments = documents
 				currentToolResults = toolResults
 			} else {
 				userMsg := KiroUserInputMessage{
@@ -229,6 +274,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				}
 				if len(images) > 0 {
 					userMsg.Images = images
+				}
+				if len(documents) > 0 {
+					userMsg.Documents = documents
 				}
 				if len(toolResults) > 0 {
 					userMsg.UserInputMessageContext = &UserInputMessageContext{
@@ -293,7 +341,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else if currentContent != "" {
 		finalContent = currentContent
 	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
+		finalContent = normalizeUserContent("", true, false)
+	} else if len(currentDocuments) > 0 {
+		finalContent = normalizeUserContent("", false, true)
 	} else if len(currentToolResults) > 0 {
 		finalContent = buildToolResultsContinuation(currentToolResults)
 	} else {
@@ -311,10 +361,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: finalContent,
-		ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Content:   finalContent,
+		ModelID:   modelID,
+		Origin:    origin,
+		Images:    currentImages,
+		Documents: currentDocuments,
 	}
 
 	// Only attach structured tool results when they answer the last history
@@ -627,13 +678,14 @@ func extractSystemPrompt(system interface{}) string {
 	return ""
 }
 
-func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroToolResult) {
+func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroDocument, []KiroToolResult) {
 	var text string
 	var images []KiroImage
+	var documents []KiroDocument
 	var toolResults []KiroToolResult
 
 	if s, ok := content.(string); ok {
-		return s, nil, nil
+		return s, nil, nil, nil
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -652,14 +704,25 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 			case "image", "image_url", "input_image":
 				if img := extractImageFromClaudeBlock(block); img != nil {
 					images = append(images, *img)
+				} else if doc := extractDocumentFromClaudeBlock(block); doc != nil {
+					documents = appendKiroDocument(documents, doc)
+				}
+			case "document", "input_file", "file":
+				if doc := extractDocumentFromClaudeBlock(block); doc != nil {
+					documents = appendKiroDocument(documents, doc)
 				}
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
-				resultContent, resultImages := extractToolResultContent(block["content"])
-				if len(resultImages) > 0 {
+				resultContent, resultImages, resultDocuments := extractToolResultContent(block["content"])
+				if len(resultImages) > 0 || len(resultDocuments) > 0 {
 					images = append(images, resultImages...)
+					documents = appendKiroDocuments(documents, resultDocuments...)
 					if strings.TrimSpace(resultContent) == "" {
-						resultContent = toolResultImagePlaceholder
+						if len(resultImages) > 0 {
+							resultContent = toolResultImagePlaceholder
+						} else {
+							resultContent = toolResultDocumentPlaceholder
+						}
 					}
 				}
 				toolResults = append(toolResults, KiroToolResult{
@@ -671,7 +734,7 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 		}
 	}
 
-	return text, images, toolResults
+	return text, images, documents, toolResults
 }
 
 func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
@@ -712,13 +775,55 @@ func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
 	return nil
 }
 
-func extractToolResultContent(content interface{}) (string, []KiroImage) {
+func extractDocumentFromClaudeBlock(block map[string]interface{}) *KiroDocument {
+	name := extractDocumentName(block, "")
+	if source, ok := block["source"].(map[string]interface{}); ok {
+		name = extractDocumentName(source, name)
+		if data, ok := source["data"].(string); ok {
+			if doc := parseDocumentDataURL(data, name); doc != nil {
+				return doc
+			}
+			mediaType := mediaTypeFromMap(source)
+			if mediaType == "" {
+				mediaType = mediaTypeFromMap(block)
+			}
+			format, _ := documentFormatFromMimeOrName(mediaType, name)
+			if doc := parseBase64Document(data, format, name); doc != nil {
+				return doc
+			}
+		}
+		if url, ok := source["url"].(string); ok {
+			if doc := parseDocumentDataURL(url, name); doc != nil {
+				return doc
+			}
+		}
+	}
+
+	if doc := extractDocumentFromOpenAIPart(block); doc != nil {
+		return doc
+	}
+
+	if data, ok := block["data"].(string); ok {
+		if doc := parseDocumentDataURL(data, name); doc != nil {
+			return doc
+		}
+		format, _ := documentFormatFromMimeOrName(mediaTypeFromMap(block), name)
+		if doc := parseBase64Document(data, format, name); doc != nil {
+			return doc
+		}
+	}
+
+	return nil
+}
+
+func extractToolResultContent(content interface{}) (string, []KiroImage, []KiroDocument) {
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, nil
 	}
 	if blocks, ok := content.([]interface{}); ok {
 		var parts []string
 		var images []KiroImage
+		var documents []KiroDocument
 		for _, b := range blocks {
 			block, ok := b.(map[string]interface{})
 			if !ok {
@@ -731,6 +836,15 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 					images = append(images, *img)
 					continue
 				}
+				if doc := extractDocumentFromClaudeBlock(block); doc != nil {
+					documents = appendKiroDocument(documents, doc)
+					continue
+				}
+			case "document", "input_file", "file":
+				if doc := extractDocumentFromClaudeBlock(block); doc != nil {
+					documents = appendKiroDocument(documents, doc)
+					continue
+				}
 			}
 			if text, ok := block["text"].(string); ok {
 				parts = append(parts, text)
@@ -738,11 +852,15 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 			}
 			if img := extractImageFromClaudeBlock(block); img != nil {
 				images = append(images, *img)
+				continue
+			}
+			if doc := extractDocumentFromClaudeBlock(block); doc != nil {
+				documents = appendKiroDocument(documents, doc)
 			}
 		}
-		return strings.Join(parts, ""), images
+		return strings.Join(parts, ""), images, documents
 	}
-	return "", nil
+	return "", nil, nil
 }
 
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
@@ -1179,6 +1297,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	history := make([]KiroHistoryMessage, 0)
 	var currentContent string
 	var currentImages []KiroImage
+	var currentDocuments []KiroDocument
 	var currentToolResults []KiroToolResult
 
 	for i, msg := range nonSystemMessages {
@@ -1186,19 +1305,22 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 		switch msg.Role {
 		case "user":
-			content, images := extractOpenAIUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			content, images, documents := extractOpenAIUserContent(msg.Content)
+			content, documents = inlinePDFDocuments(content, documents)
+			content = normalizeUserContent(content, len(images) > 0, len(documents) > 0)
 
 			if isLast {
 				currentContent = content
 				currentImages = images
+				currentDocuments = documents
 			} else {
 				history = append(history, KiroHistoryMessage{
 					UserInputMessage: &KiroUserInputMessage{
-						Content: content,
-						ModelID: modelID,
-						Origin:  origin,
-						Images:  images,
+						Content:   content,
+						ModelID:   modelID,
+						Origin:    origin,
+						Images:    images,
+						Documents: documents,
 					},
 				})
 			}
@@ -1228,13 +1350,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			})
 
 		case "tool":
-			cleanText, toolImages := extractOpenAIUserContent(msg.Content)
+			cleanText, toolImages, toolDocuments := extractOpenAIUserContent(msg.Content)
 			var content string
-			if len(toolImages) > 0 {
+			if len(toolImages) > 0 || len(toolDocuments) > 0 {
 				currentImages = append(currentImages, toolImages...)
+				currentDocuments = appendKiroDocuments(currentDocuments, toolDocuments...)
 				content = strings.TrimSpace(cleanText)
 				if content == "" {
-					content = toolResultImagePlaceholder
+					if len(toolImages) > 0 {
+						content = toolResultImagePlaceholder
+					} else {
+						content = toolResultDocumentPlaceholder
+					}
 				}
 			} else {
 				content = extractOpenAIMessageText(msg.Content)
@@ -1255,9 +1382,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 					// (continuation text + narrated text).
 					history = append(history, KiroHistoryMessage{
 						UserInputMessage: &KiroUserInputMessage{
-							ModelID: modelID,
-							Origin:  origin,
-							Images:  currentImages,
+							ModelID:   modelID,
+							Origin:    origin,
+							Images:    currentImages,
+							Documents: currentDocuments,
 							UserInputMessageContext: &UserInputMessageContext{
 								ToolResults: currentToolResults,
 							},
@@ -1265,6 +1393,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 					})
 					currentToolResults = nil
 					currentImages = nil
+					currentDocuments = nil
 				}
 			}
 		}
@@ -1306,7 +1435,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		if len(currentToolResults) > 0 && !keepCurrentToolResults {
 			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else if len(currentImages) > 0 {
-			finalContent = normalizeUserContent("", true)
+			finalContent = normalizeUserContent("", true, false)
+		} else if len(currentDocuments) > 0 {
+			finalContent = normalizeUserContent("", false, true)
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
@@ -1325,10 +1456,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: finalContent,
-		ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Content:   finalContent,
+		ModelID:   modelID,
+		Origin:    origin,
+		Images:    currentImages,
+		Documents: currentDocuments,
 	}
 
 	var attachToolResults []KiroToolResult
@@ -1366,13 +1498,14 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
+func extractOpenAIUserContent(content interface{}) (string, []KiroImage, []KiroDocument) {
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, nil
 	}
 
 	var text string
 	var images []KiroImage
+	var documents []KiroDocument
 
 	if part, ok := content.(map[string]interface{}); ok {
 		if t, ok := extractOpenAITextPart(part); ok {
@@ -1380,6 +1513,8 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 		}
 		if img := extractImageFromOpenAIPart(part); img != nil {
 			images = append(images, *img)
+		} else if doc := extractDocumentFromOpenAIPart(part); doc != nil {
+			documents = appendKiroDocument(documents, doc)
 		}
 	}
 
@@ -1395,15 +1530,17 @@ func extractOpenAIUserContent(content interface{}) (string, []KiroImage) {
 			}
 			if img := extractImageFromOpenAIPart(part); img != nil {
 				images = append(images, *img)
+			} else if doc := extractDocumentFromOpenAIPart(part); doc != nil {
+				documents = appendKiroDocument(documents, doc)
 			}
 		}
 	}
 
-	if len(images) > 0 {
+	if len(images) > 0 || len(documents) > 0 {
 		text = sanitizeImagePlaceholders(text)
 	}
 
-	return text, images
+	return text, images, documents
 }
 
 func extractOpenAIMessageText(content interface{}) string {
@@ -1415,7 +1552,7 @@ func extractOpenAIMessageText(content interface{}) string {
 		return s
 	}
 
-	if text, _ := extractOpenAIUserContent(content); strings.TrimSpace(text) != "" {
+	if text, _, _ := extractOpenAIUserContent(content); strings.TrimSpace(text) != "" {
 		return text
 	}
 
@@ -1651,7 +1788,10 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		// placeholder like ".": replayed across a long history that produces
 		// dozens of "." assistant turns, which the model then imitates by
 		// replying ".". Mark such turns for removal instead.
-		if msg.UserInputMessage != nil && strings.TrimSpace(msg.UserInputMessage.Content) == "" && len(msg.UserInputMessage.Images) == 0 {
+		if msg.UserInputMessage != nil &&
+			strings.TrimSpace(msg.UserInputMessage.Content) == "" &&
+			len(msg.UserInputMessage.Images) == 0 &&
+			len(msg.UserInputMessage.Documents) == 0 {
 			msg.UserInputMessage.Content = minimalFallbackUserContent
 		}
 	}
@@ -1681,7 +1821,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			if last.UserInputMessage != nil &&
 				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
 				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
-				len(msg.UserInputMessage.Images) == 0 {
+				len(msg.UserInputMessage.Images) == 0 &&
+				len(msg.UserInputMessage.Documents) == 0 {
 				continue // skip duplicate consecutive user turn
 			}
 		}
@@ -1870,21 +2011,25 @@ func currentMessageModelID(payload *KiroPayload) string {
 // when even the minimal retained history plus current message exceeds the limit.
 //
 // The current message can be oversized for three independent reasons: large text
-// Content, large base64 Images, or large structured ToolResults. Shrinking only
-// Content (the previous behavior) silently failed whenever the bulk lived in
-// Images or ToolResults — overhead alone exceeded maxPayloadBytes, Content was
-// clamped to "." yet the payload stayed over-limit and upstream returned HTTP 400.
+// Content, large base64 Images/Documents, or large structured ToolResults.
+// Shrinking only Content (the previous behavior) silently failed whenever the
+// bulk lived in attachments or ToolResults — overhead alone exceeded
+// maxPayloadBytes, Content was clamped to "." yet the payload stayed over-limit
+// and upstream returned HTTP 400.
 //
 // We now trim in order of least to most semantically important: first drop
-// images (heaviest, least recoverable), then shrink tool-result text, and only
-// then shrink Content. All string trims are UTF-8 boundary-safe so the resulting
-// JSON never contains a split multi-byte rune.
+// attachments (heaviest, least recoverable), then shrink tool-result text, and
+// only then shrink Content. All string trims are UTF-8 boundary-safe so the
+// resulting JSON never contains a split multi-byte rune.
 func truncateCurrentMessage(payload *KiroPayload) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 
-	// 1) Drop images first — base64 bytes are large and cannot be partially kept.
+	// 1) Drop attachments first — base64 bytes are large and cannot be partially kept.
 	if len(cur.Images) > 0 && payloadByteSize(payload) > maxPayloadBytes {
 		cur.Images = nil
+	}
+	if len(cur.Documents) > 0 && payloadByteSize(payload) > maxPayloadBytes {
+		cur.Documents = nil
 	}
 
 	// 2) Shrink structured tool-result text if the payload is still too large.
@@ -2007,7 +2152,7 @@ func firstClaudeConversationAnchor(messages []ClaudeMessage) string {
 		if msg.Role != "user" {
 			continue
 		}
-		text, _, toolResults := extractClaudeUserContent(msg.Content)
+		text, _, _, toolResults := extractClaudeUserContent(msg.Content)
 		if strings.TrimSpace(text) != "" {
 			return strings.TrimSpace(text)
 		}
@@ -2049,7 +2194,7 @@ func isSyntheticConversationAnchor(anchor string) bool {
 
 	normalized := strings.ToLower(strings.Join(strings.Fields(anchor), " "))
 	switch normalized {
-	case ".", "begin conversation", "please analyze the attached image.", strings.ToLower(minimalFallbackUserContent):
+	case ".", "begin conversation", "please analyze the attached image.", "please analyze the attached document.", strings.ToLower(minimalFallbackUserContent):
 		return true
 	default:
 		return false
@@ -2070,6 +2215,67 @@ func extractOpenAITextPart(part map[string]interface{}) (string, bool) {
 	}
 
 	return "", false
+}
+
+func appendKiroDocument(documents []KiroDocument, doc *KiroDocument) []KiroDocument {
+	if doc == nil || len(documents) >= maxKiroDocuments {
+		return documents
+	}
+	return append(documents, *doc)
+}
+
+func appendKiroDocuments(documents []KiroDocument, additions ...KiroDocument) []KiroDocument {
+	for _, doc := range additions {
+		if len(documents) >= maxKiroDocuments {
+			break
+		}
+		documents = append(documents, doc)
+	}
+	return documents
+}
+
+func extractDocumentFromOpenAIPart(part map[string]interface{}) *KiroDocument {
+	return extractDocumentFromOpenAIPartWithFallback(part, "")
+}
+
+func extractDocumentFromOpenAIPartWithFallback(part map[string]interface{}, fallbackName string) *KiroDocument {
+	partType, _ := part["type"].(string)
+	if partType != "" {
+		switch partType {
+		case "document", "input_file", "file":
+		default:
+			return nil
+		}
+	}
+
+	name := extractDocumentName(part, fallbackName)
+
+	for _, key := range []string{"file", "source"} {
+		if nested, ok := part[key].(map[string]interface{}); ok {
+			if doc := extractDocumentFromOpenAIPartWithFallback(nested, name); doc != nil {
+				return doc
+			}
+		}
+	}
+
+	for _, key := range []string{"file_data", "data", "base64", "b64_json", "content", "bytes"} {
+		data, ok := part[key].(string)
+		if !ok || strings.TrimSpace(data) == "" {
+			continue
+		}
+		if doc := parseDocumentDataURL(data, name); doc != nil {
+			return doc
+		}
+		format, ok := documentFormatFromMimeOrName(mediaTypeFromMap(part), name)
+		if !ok {
+			return nil
+		}
+		if doc := parseBase64Document(data, format, name); doc != nil {
+			return doc
+		}
+	}
+
+	return nil
 }
 
 func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
@@ -2094,13 +2300,8 @@ func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
 		}
 	}
 
-	if raw, ok := part["mime"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
-		return nil
-	}
-	if raw, ok := part["media_type"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
-		return nil
-	}
-	if raw, ok := part["mime_type"].(string); ok && !strings.HasPrefix(strings.ToLower(raw), "image/") {
+	format, hasExplicitFormat := explicitOpenAIImageFormat(part)
+	if hasExplicitFormat && !isSupportedKiroImageFormat(format) {
 		return nil
 	}
 
@@ -2111,7 +2312,7 @@ func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
 	}
 
 	if raw, ok := part["b64_json"].(string); ok {
-		if img := parseBase64Image(raw, "png"); img != nil {
+		if img := parseBase64Image(raw, format); img != nil {
 			return img
 		}
 	}
@@ -2132,7 +2333,7 @@ func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
 	}
 
 	if raw, ok := part["image_base64"].(string); ok {
-		if img := parseBase64Image(raw, "png"); img != nil {
+		if img := parseBase64Image(raw, format); img != nil {
 			return img
 		}
 	}
@@ -2140,12 +2341,21 @@ func extractImageFromOpenAIPart(part map[string]interface{}) *KiroImage {
 		if img := parseDataURL(raw); img != nil {
 			return img
 		}
-		if img := parseBase64Image(raw, "png"); img != nil {
+		if img := parseBase64Image(raw, format); img != nil {
 			return img
 		}
 	}
 
 	return nil
+}
+
+func explicitOpenAIImageFormat(part map[string]interface{}) (string, bool) {
+	for _, key := range []string{"mime", "media_type", "mediaType", "mime_type"} {
+		if raw, ok := part[key].(string); ok && strings.TrimSpace(raw) != "" {
+			return normalizeKiroImageFormat(raw), true
+		}
+	}
+	return "", false
 }
 
 func sanitizeImagePlaceholders(text string) string {
@@ -2155,10 +2365,13 @@ func sanitizeImagePlaceholders(text string) string {
 	return strings.TrimSpace(cleaned)
 }
 
-func normalizeUserContent(text string, hasImages bool) string {
+func normalizeUserContent(text string, hasImages, hasDocuments bool) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" && hasImages {
 		return "Please analyze the attached image."
+	}
+	if trimmed == "" && hasDocuments {
+		return "Please analyze the attached document."
 	}
 	return trimmed
 }
@@ -2181,32 +2394,282 @@ func parseDataURL(url string) *KiroImage {
 }
 
 func parseBase64Image(data, format string) *KiroImage {
-	format = strings.ToLower(format)
-	if format == "jpg" {
-		format = "jpeg"
+	format = normalizeKiroImageFormat(format)
+	if !isSupportedKiroImageFormat(format) {
+		return nil
 	}
+
+	cleanedData := cleanBase64Payload(data)
 
 	// 验证 base64
-	if _, err := base64.StdEncoding.DecodeString(data); err != nil {
-		if _, errRaw := base64.RawStdEncoding.DecodeString(data); errRaw != nil {
-			if _, errURL := base64.URLEncoding.DecodeString(data); errURL != nil {
-				if _, errRawURL := base64.RawURLEncoding.DecodeString(data); errRawURL != nil {
-					return nil
-				}
-			}
-		}
-	}
-
-	if format == "" {
-		format = "png"
+	if _, err := decodeBase64Payload(cleanedData); err != nil {
+		return nil
 	}
 
 	return &KiroImage{
 		Format: format,
 		Source: struct {
 			Bytes string `json:"bytes"`
-		}{Bytes: data},
+		}{Bytes: cleanedData},
 	}
+}
+
+func normalizeKiroImageFormat(format string) string {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if i := strings.Index(format, ";"); i >= 0 {
+		format = strings.TrimSpace(format[:i])
+	}
+	format = strings.TrimPrefix(format, "image/")
+	if format == "jpg" {
+		format = "jpeg"
+	}
+	if format == "" {
+		format = "png"
+	}
+	return format
+}
+
+func isSupportedKiroImageFormat(format string) bool {
+	switch format {
+	case "png", "jpeg", "gif", "webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func mediaTypeFromMap(values map[string]interface{}) string {
+	for _, key := range []string{"media_type", "mediaType", "mime_type", "mime", "content_type", "contentType", "format"} {
+		if raw, ok := values[key].(string); ok && strings.TrimSpace(raw) != "" {
+			return raw
+		}
+	}
+	return ""
+}
+
+func extractDocumentName(values map[string]interface{}, fallback string) string {
+	name := fallback
+	for _, key := range []string{"name", "filename", "file_name", "fileName", "title"} {
+		if raw, ok := values[key].(string); ok && strings.TrimSpace(raw) != "" {
+			name = raw
+			break
+		}
+	}
+	return strings.TrimSpace(name)
+}
+
+func documentFormatFromMimeOrName(mediaType, name string) (string, bool) {
+	if format, ok := normalizeKiroDocumentFormat(mediaType); ok {
+		return format, true
+	}
+	if loc := documentNameExtensionPattern.FindStringIndex(strings.TrimSpace(name)); loc != nil {
+		if format, ok := normalizeKiroDocumentFormat(name[loc[0]+1:]); ok {
+			return format, true
+		}
+	}
+	return "", false
+}
+
+func normalizeKiroDocumentFormat(format string) (string, bool) {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if i := strings.Index(format, ";"); i >= 0 {
+		format = strings.TrimSpace(format[:i])
+	}
+	format = strings.TrimPrefix(format, ".")
+	if mapped, ok := kiroDocumentFormatsByMime[format]; ok {
+		return mapped, true
+	}
+	if mapped, ok := kiroDocumentFormatsByExtension[format]; ok {
+		return mapped, true
+	}
+	return "", false
+}
+
+func parseDocumentDataURL(url, name string) *KiroDocument {
+	cleaned := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(url, "\n", ""), "\r", ""))
+	if !strings.HasPrefix(strings.ToLower(cleaned), "data:") {
+		return nil
+	}
+	comma := strings.Index(cleaned, ",")
+	if comma < 0 {
+		return nil
+	}
+
+	metadata := cleaned[len("data:"):comma]
+	data := cleaned[comma+1:]
+	parts := strings.Split(metadata, ";")
+	if len(parts) == 0 {
+		return nil
+	}
+
+	hasBase64 := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(part), "base64") {
+			hasBase64 = true
+			break
+		}
+	}
+	if !hasBase64 {
+		return nil
+	}
+
+	format, ok := documentFormatFromMimeOrName(parts[0], name)
+	if !ok {
+		return nil
+	}
+	return parseBase64Document(data, format, name)
+}
+
+func parseBase64Document(data, format, name string) *KiroDocument {
+	normalizedFormat, ok := normalizeKiroDocumentFormat(format)
+	if !ok {
+		return nil
+	}
+
+	cleanedData := cleanBase64Payload(data)
+	if _, err := decodeBase64Payload(cleanedData); err != nil {
+		return nil
+	}
+
+	doc := &KiroDocument{
+		Name:   sanitizeDocumentName(name, normalizedFormat),
+		Format: normalizedFormat,
+	}
+	doc.Source.Bytes = cleanedData
+	return doc
+}
+
+// inlinePDFDocuments extracts text from any PDF documents and folds it into the
+// message text, then returns the documents with those PDFs removed. The Kiro
+// cloud accepts the documents field (no 400) but does not expose PDF bytes to
+// the model — verified end-to-end — while still counting the bytes as input
+// tokens. Extracting locally and inlining the text is the only way to make the
+// model actually read PDF content. Non-PDF documents are left untouched, and a
+// PDF whose text cannot be extracted is preserved as-is so behavior never
+// regresses.
+func inlinePDFDocuments(text string, documents []KiroDocument) (string, []KiroDocument) {
+	if len(documents) == 0 {
+		return text, documents
+	}
+
+	var kept []KiroDocument
+	var inlined []string
+	for _, doc := range documents {
+		if doc.Format != "pdf" {
+			kept = append(kept, doc)
+			continue
+		}
+		extracted := extractPDFText(doc.Source.Bytes)
+		if extracted == "" {
+			// Could not extract; keep the original document so we never lose data.
+			kept = append(kept, doc)
+			continue
+		}
+		label := strings.TrimSpace(doc.Name)
+		if label == "" {
+			label = "document.pdf"
+		}
+		inlined = append(inlined, fmt.Sprintf("[Content extracted from attached PDF \"%s\"]\n%s", label, extracted))
+	}
+
+	if len(inlined) == 0 {
+		return text, documents
+	}
+
+	combined := strings.Join(inlined, "\n\n")
+	merged := joinHistoryText(text, combined)
+	return merged, kept
+}
+
+// extractPDFText decodes a base64 PDF payload and returns its plain text. It
+// returns an empty string on any failure (bad base64, unparseable PDF, no text
+// layer). The underlying parser can panic on malformed PDFs, so the work is
+// wrapped in a recover.
+func extractPDFText(b64 string) (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = ""
+		}
+	}()
+
+	decoded, err := decodeBase64Payload(b64)
+	if err != nil || len(decoded) == 0 {
+		return ""
+	}
+
+	reader, err := pdf.NewReader(bytes.NewReader(decoded), int64(len(decoded)))
+	if err != nil {
+		return ""
+	}
+	plain, err := reader.GetPlainText()
+	if err != nil {
+		return ""
+	}
+
+	var buf bytes.Buffer
+	if _, err := io.CopyN(&buf, plain, maxInlinedPDFTextBytes+1); err != nil && err != io.EOF {
+		return ""
+	}
+
+	out := strings.TrimSpace(buf.String())
+	if out == "" {
+		return ""
+	}
+	if len(out) > maxInlinedPDFTextBytes {
+		out = out[:maxInlinedPDFTextBytes] + "\n[PDF content truncated]"
+	}
+	return out
+}
+
+func sanitizeDocumentName(name, format string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\x00", ""))
+	name = strings.ReplaceAll(name, "\\", "/")
+	if slash := strings.LastIndex(name, "/"); slash >= 0 {
+		name = name[slash+1:]
+	}
+
+	stem := name
+	if loc := documentNameExtensionPattern.FindStringIndex(name); loc != nil {
+		stem = name[:loc[0]]
+	}
+	stem = documentNameUnsafePattern.ReplaceAllString(stem, "-")
+	stem = documentNameRepeatedHyphenPattern.ReplaceAllString(stem, "-")
+	stem = documentNameRepeatedSpacePattern.ReplaceAllString(stem, " ")
+	stem = strings.Trim(stem, " -")
+	if stem == "" {
+		stem = "document"
+	}
+
+	if format == "" {
+		return stem
+	}
+	return stem + "." + format
+}
+
+func cleanBase64Payload(data string) string {
+	data = strings.TrimSpace(data)
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\n', '\r', '\t':
+			return -1
+		default:
+			return r
+		}
+	}, data)
+}
+
+func decodeBase64Payload(data string) ([]byte, error) {
+	data = cleanBase64Payload(data)
+	if decoded, err := base64.StdEncoding.DecodeString(data); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(data); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(data); err == nil {
+		return decoded, nil
+	}
+	return base64.RawURLEncoding.DecodeString(data)
 }
 
 func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {

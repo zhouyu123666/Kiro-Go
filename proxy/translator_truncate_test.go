@@ -124,6 +124,28 @@ func TestTruncateCurrentMessageDropsOversizedImages(t *testing.T) {
 	}
 }
 
+func TestTruncateCurrentMessageDropsOversizedDocuments(t *testing.T) {
+	bigDoc := KiroDocument{Name: "big.pdf", Format: "pdf"}
+	bigDoc.Source.Bytes = strings.Repeat("A", maxPayloadBytes+50*1024)
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content:   "summarize this document",
+		ModelID:   "claude-opus-4.8",
+		Origin:    "AI_EDITOR",
+		Documents: []KiroDocument{bigDoc},
+	}
+
+	truncateCurrentMessage(payload)
+
+	if got := payloadByteSize(payload); got > maxPayloadBytes {
+		t.Fatalf("payload size %d still exceeds limit %d after truncation", got, maxPayloadBytes)
+	}
+	if len(payload.ConversationState.CurrentMessage.UserInputMessage.Documents) != 0 {
+		t.Fatalf("expected oversized documents to be dropped")
+	}
+}
+
 // TestTruncateCurrentMessageShrinksOversizedToolResults verifies that an
 // oversized current message whose bulk lives in structured tool-result text is
 // shrunk below the limit rather than left over-limit.

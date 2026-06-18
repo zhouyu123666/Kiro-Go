@@ -171,6 +171,7 @@ type KiroUserInputMessage struct {
 	ModelID                 string                   `json:"modelId,omitempty"`
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
+	Documents               []KiroDocument           `json:"documents,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
 }
 
@@ -202,6 +203,14 @@ type KiroResultContent struct {
 }
 
 type KiroImage struct {
+	Format string `json:"format"`
+	Source struct {
+		Bytes string `json:"bytes"`
+	} `json:"source"`
+}
+
+type KiroDocument struct {
+	Name   string `json:"name"`
 	Format string `json:"format"`
 	Source struct {
 		Bytes string `json:"bytes"`

@@ -86,8 +86,8 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 			continue
 		}
 
-		text, images, toolResults := extractClaudeUserContent(msg.Content)
-		if normalizeUserContent(text, len(images) > 0) != "" || len(toolResults) > 0 {
+		text, images, documents, toolResults := extractClaudeUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0, len(documents) > 0) != "" || len(toolResults) > 0 {
 			hasUserContext = true
 		}
 	}
@@ -191,8 +191,8 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 		if role != "user" {
 			continue
 		}
-		text, images := extractOpenAIUserContent(msg.Content)
-		if normalizeUserContent(text, len(images) > 0) != "" {
+		text, images, documents := extractOpenAIUserContent(msg.Content)
+		if normalizeUserContent(text, len(images) > 0, len(documents) > 0) != "" {
 			hasUserContext = true
 		}
 	}

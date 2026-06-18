@@ -471,6 +471,123 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	}
 }
 
+func TestClaudePDFSourceIsNotForwardedAsImage(t *testing.T) {
+	const pdfData = "JVBERi0xLjQK"
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{"type": "text", "text": "summarize this"},
+					map[string]interface{}{
+						"type": "image",
+						"source": map[string]interface{}{
+							"type":       "base64",
+							"media_type": "application/pdf",
+							"data":       pdfData,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 0 {
+		t.Fatalf("expected PDF source to be ignored as an image, got %#v", cur.Images)
+	}
+	if len(cur.Documents) != 1 {
+		t.Fatalf("expected PDF source to be forwarded as one document, got %d", len(cur.Documents))
+	}
+	if cur.Documents[0].Format != "pdf" || cur.Documents[0].Source.Bytes != pdfData {
+		t.Fatalf("unexpected PDF document payload: %+v", cur.Documents[0])
+	}
+	if cur.Content != "summarize this" {
+		t.Fatalf("expected text content preserved, got %q", cur.Content)
+	}
+}
+
+func TestOpenAIPDFInputFileIsNotForwardedAsImage(t *testing.T) {
+	const pdfData = "JVBERi0xLjQK"
+	req := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{"type": "input_text", "text": "summarize this"},
+					map[string]interface{}{
+						"type":      "input_file",
+						"mime_type": "application/pdf",
+						"data":      pdfData,
+					},
+				},
+			},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 0 {
+		t.Fatalf("expected PDF input_file to be ignored as an image, got %#v", cur.Images)
+	}
+	if len(cur.Documents) != 1 {
+		t.Fatalf("expected PDF input_file to be forwarded as one document, got %d", len(cur.Documents))
+	}
+	if cur.Documents[0].Format != "pdf" || cur.Documents[0].Source.Bytes != pdfData {
+		t.Fatalf("unexpected PDF document payload: %+v", cur.Documents[0])
+	}
+	if cur.Content != "summarize this" {
+		t.Fatalf("expected text content preserved, got %q", cur.Content)
+	}
+}
+
+func TestOpenAIFileDataURLIsForwardedAsDocument(t *testing.T) {
+	const pdfData = "JVBERi0xLjQK"
+	req := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{"type": "input_text", "text": "summarize this"},
+					map[string]interface{}{
+						"type":      "file",
+						"filename":  "report.pdf",
+						"file_data": "data:application/pdf;base64," + pdfData,
+					},
+				},
+			},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if len(cur.Images) != 0 {
+		t.Fatalf("expected PDF file_data to be ignored as an image, got %#v", cur.Images)
+	}
+	if len(cur.Documents) != 1 {
+		t.Fatalf("expected one PDF document, got %d", len(cur.Documents))
+	}
+	if cur.Documents[0].Name != "report.pdf" {
+		t.Fatalf("expected sanitized filename report.pdf, got %q", cur.Documents[0].Name)
+	}
+	if cur.Documents[0].Format != "pdf" || cur.Documents[0].Source.Bytes != pdfData {
+		t.Fatalf("unexpected PDF document payload: %+v", cur.Documents[0])
+	}
+}
+
+func TestParseBase64ImageRejectsUnsupportedFormats(t *testing.T) {
+	const data = "JVBERi0xLjQK"
+	for _, format := range []string{"application/pdf", "uri", "bmp", "image/svg+xml"} {
+		if img := parseBase64Image(data, format); img != nil {
+			t.Fatalf("expected format %q to be rejected, got %#v", format, img)
+		}
+	}
+}
+
 func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 	const imgData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	req := &ClaudeRequest{
