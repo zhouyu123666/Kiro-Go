@@ -323,6 +323,13 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	if keepCurrentToolResults {
 		attachToolResults = currentToolResults
 	}
+	// Kiro rejects structured toolResults/toolUses without a populated tools
+	// field (TOOL_CONFIG_MISSING). When the client replays a tool turn but omits
+	// the tool definitions, synthesize placeholder specs from the active turn so
+	// the structured turn survives and the upstream accepts the request.
+	if len(kiroTools) == 0 && len(attachToolResults) > 0 {
+		kiroTools = synthesizeToolSpecsForActiveTurn(history)
+	}
 	if len(kiroTools) > 0 || len(attachToolResults) > 0 {
 		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
 			Tools:       kiroTools,
@@ -803,6 +810,42 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	return result, nameMap
 }
 
+// synthesizeToolSpecsForActiveTurn builds minimal tool specifications for the
+// tool calls of the active tool turn (the final history assistant message). Kiro
+// rejects a request that carries structured toolResults/toolUses unless the
+// tools field (toolConfig) is also populated ("TOOL_CONFIG_MISSING"). When the
+// client replays a tool turn without re-sending the original tool definitions
+// (e.g. Claude Code / Codex follow-up requests omit the tools array), we
+// reconstruct a placeholder spec per tool name so the active turn stays
+// structured and the upstream accepts it.
+func synthesizeToolSpecsForActiveTurn(history []KiroHistoryMessage) []KiroToolWrapper {
+	if len(history) == 0 {
+		return nil
+	}
+	last := history[len(history)-1].AssistantResponseMessage
+	if last == nil || len(last.ToolUses) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(last.ToolUses))
+	result := make([]KiroToolWrapper, 0, len(last.ToolUses))
+	for _, tu := range last.ToolUses {
+		name := strings.TrimSpace(tu.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = name
+		w.ToolSpecification.Description = normalizeToolDesc("", name)
+		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(nil)}
+		result = append(result, w)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
 func ensureObjectSchema(schema interface{}) interface{} {
 	m, ok := schema.(map[string]interface{})
@@ -1267,6 +1310,13 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	var attachToolResults []KiroToolResult
 	if keepCurrentToolResults {
 		attachToolResults = currentToolResults
+	}
+	// Kiro rejects structured toolResults/toolUses without a populated tools
+	// field (TOOL_CONFIG_MISSING). When the client replays a tool turn but omits
+	// the tool definitions, synthesize placeholder specs from the active turn so
+	// the structured turn survives and the upstream accepts the request.
+	if len(kiroTools) == 0 && len(attachToolResults) > 0 {
+		kiroTools = synthesizeToolSpecsForActiveTurn(history)
 	}
 	if len(kiroTools) > 0 || len(attachToolResults) > 0 {
 		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
