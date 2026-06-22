@@ -8,6 +8,17 @@ import (
 
 const claudeTokenCorrectionFactor = 1.15
 
+// Binary media (images, documents) is sent to the model as attachments, not as
+// the raw base64 string in the request body. Estimating these blocks by JSON-
+// marshalling them would count the base64 payload (~bytes/4 tokens), which makes
+// even a modest image look like hundreds of thousands of tokens and trips the
+// input limit before the request reaches upstream. Use fixed per-attachment
+// estimates that approximate the model's actual accounting instead.
+const (
+	approxImageInputTokens    = 1600
+	approxDocumentInputTokens = 3000
+)
+
 func estimateApproxTokens(text string) int {
 	if text == "" {
 		return 0
@@ -154,6 +165,10 @@ func estimateClaudeValueTokens(v interface{}) int {
 			if content, ok := value["content"]; ok {
 				return estimateClaudeValueTokens(content)
 			}
+		case "image", "image_url", "input_image":
+			return approxImageInputTokens
+		case "document", "input_file", "file":
+			return approxDocumentInputTokens
 		}
 
 		total := 0
@@ -220,11 +235,33 @@ func estimateOpenAIContentTokens(content interface{}) int {
 		return 0
 	case string:
 		return estimateApproxTokens(value)
-	default:
-		text := extractOpenAIMessageText(value)
-		if text != "" {
+	case []interface{}:
+		total := 0
+		for _, part := range value {
+			total += estimateOpenAIContentTokens(part)
+		}
+		return total
+	case map[string]interface{}:
+		switch partType, _ := value["type"].(string); partType {
+		case "text", "input_text", "output_text":
+			if text, ok := value["text"].(string); ok {
+				return estimateApproxTokens(text)
+			}
+		case "image", "image_url", "input_image":
+			return approxImageInputTokens
+		case "file", "input_file", "document":
+			return approxDocumentInputTokens
+		}
+		if nested, ok := value["content"]; ok {
+			if n := estimateOpenAIContentTokens(nested); n > 0 {
+				return n
+			}
+		}
+		if text, ok := value["text"].(string); ok {
 			return estimateApproxTokens(text)
 		}
+		return estimateJSONTokens(value)
+	default:
 		return estimateJSONTokens(value)
 	}
 }

@@ -142,6 +142,75 @@ func TestTokenEstimateDoesNotUndercountShortRepeatedWords(t *testing.T) {
 	}
 }
 
+// largeBase64 returns a base64-like string whose raw byte length far exceeds
+// the input token limit, simulating an inlined image/document payload.
+func largeBase64() string {
+	return strings.Repeat("A", maxKiroInputTokens*8)
+}
+
+func TestClaudeImageBlockDoesNotTripInputLimit(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.7",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "describe this"},
+				map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type":       "base64",
+						"media_type": "image/png",
+						"data":       largeBase64(),
+					},
+				},
+			}},
+		},
+	}
+	if got := estimateClaudeRequestInputTokens(req); got > maxKiroInputTokens {
+		t.Fatalf("image block must not be estimated by base64 length, got %d tokens", got)
+	}
+}
+
+func TestClaudeDocumentBlockDoesNotTripInputLimit(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.7",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type": "document",
+					"source": map[string]interface{}{
+						"type":       "base64",
+						"media_type": "application/pdf",
+						"data":       largeBase64(),
+					},
+				},
+			}},
+		},
+	}
+	if got := estimateClaudeRequestInputTokens(req); got > maxKiroInputTokens {
+		t.Fatalf("document block must not be estimated by base64 length, got %d tokens", got)
+	}
+}
+
+func TestOpenAIImageContentDoesNotTripInputLimit(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "claude-opus-4.7",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "describe this"},
+				map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": "data:image/png;base64," + largeBase64(),
+					},
+				},
+			}},
+		},
+	}
+	if got := estimateOpenAIRequestInputTokens(req); got > maxKiroInputTokens {
+		t.Fatalf("image_url content must not be estimated by base64 length, got %d tokens", got)
+	}
+}
+
 func assertContextLimitError(t *testing.T, rr *httptest.ResponseRecorder) {
 	t.Helper()
 	if rr.Code != http.StatusBadRequest {
