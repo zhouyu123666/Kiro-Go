@@ -4,9 +4,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"kiro-go/config"
 )
+
+func TestMain(m *testing.M) {
+	if err := config.Init(filepath.Join(os.TempDir(), "kiro-context-limit-test-config.json")); err != nil {
+		panic("config.Init: " + err.Error())
+	}
+	os.Exit(m.Run())
+}
 
 func oversizedInputText() string {
 	return strings.Repeat("context ", maxKiroInputTokens+1)
