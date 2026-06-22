@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/ledongthuc/pdf"
@@ -88,24 +87,6 @@ const maxKiroDocuments = 5
 // not surface PDF bytes to the model, so we extract text locally and inline it.
 // This cap keeps a runaway PDF from blowing past the payload size limit.
 const maxInlinedPDFTextBytes = 60 * 1024
-
-// maxPayloadBytes is the upper bound for the serialized Kiro request body.
-// Kiro's upstream rejects oversized requests with HTTP 400
-// "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
-// payload exceeds this size we drop the oldest history turns (keeping the
-// system priming, the most recent turns, the active tool turn, and the current
-// message) and insert a placeholder note so the model knows context was elided.
-// The limit is kept conservatively below the observed upstream threshold to
-// leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
-
-// truncationPlaceholder is inserted in history where older turns were dropped to
-// fit within maxPayloadBytes.
-const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
-
-// minRecentHistoryTurns is the number of most-recent history entries always kept
-// (in addition to system priming and the active tool turn) when truncating.
-const minRecentHistoryTurns = 4
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -399,8 +380,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			TopP:        req.TopP,
 		}
 	}
-
-	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
@@ -1493,8 +1472,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	truncatePayloadToLimit(payload, systemPrompt != "")
-
 	return payload
 }
 
@@ -1832,277 +1809,6 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	// Dropping hollow assistant turns can leave history starting with an
 	// assistant message; re-trim so it begins with a user turn.
 	return trimLeadingAssistantHistory(cleaned)
-}
-
-// truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits within maxPayloadBytes. It preserves, in order:
-//   - the system priming pair (if present) at the front of history,
-//   - the most recent turns (at least minRecentHistoryTurns, and always the
-//     active tool turn that pairs with the current message),
-//   - the current message itself.
-//
-// A single placeholder note (truncationPlaceholder) is inserted where older
-// turns were removed so the model is aware context was elided. hasPriming
-// indicates whether history begins with the 2-entry system priming pair.
-func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
-	if payload == nil {
-		return
-	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
-		return
-	}
-
-	history := payload.ConversationState.History
-	primingCount := 0
-	if hasPriming && len(history) >= 2 {
-		primingCount = 2
-	}
-
-	priming := history[:primingCount]
-	conversation := history[primingCount:]
-
-	// Compute the fixed overhead (everything except the trimmable conversation):
-	// priming, current message, inference config, profileArn, etc. We estimate by
-	// measuring the payload with an empty conversation tail, then add a budget for
-	// the placeholder and retained tail turns.
-	placeholderEntry := KiroHistoryMessage{
-		UserInputMessage: &KiroUserInputMessage{
-			Content: truncationPlaceholder,
-			ModelID: currentMessageModelID(payload),
-			Origin:  "AI_EDITOR",
-		},
-	}
-
-	// Precompute byte size of each conversation entry once (O(n)).
-	entrySizes := make([]int, len(conversation))
-	for i := range conversation {
-		entrySizes[i] = historyEntryByteSize(conversation[i])
-	}
-
-	// Base size: payload with priming only (no conversation), plus placeholder.
-	payload.ConversationState.History = priming
-	baseSize := payloadByteSize(payload) + historyEntryByteSize(placeholderEntry)
-
-	// Keep the largest suffix of the conversation that fits, but never fewer than
-	// minRecentHistoryTurns entries (so recent context is preserved).
-	keepFrom := len(conversation)
-	running := baseSize
-	for i := len(conversation) - 1; i >= 0; i-- {
-		running += entrySizes[i]
-		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
-			break
-		}
-		keepFrom = i
-	}
-
-	currentToolResultIDs := currentMessageToolResultIDs(payload)
-	tail := conversation[keepFrom:]
-	if keepFrom > 0 {
-		tail = dropLeadingAssistantUnlessActive(tail, currentToolResultIDs)
-	}
-
-	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
-	rebuilt = append(rebuilt, priming...)
-	if keepFrom > 0 { // older turns were dropped → note the elision
-		rebuilt = append(rebuilt, placeholderEntry)
-	}
-	rebuilt = append(rebuilt, tail...)
-	payload.ConversationState.History = rebuilt
-	repairCurrentToolResultPairing(payload)
-
-	// If still too large (current message or retained tail alone exceeds the
-	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
-	}
-}
-
-// historyEntryByteSize returns the serialized size of a single history entry,
-// including the surrounding JSON array delimiter overhead (1 byte for the comma).
-func historyEntryByteSize(entry KiroHistoryMessage) int {
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return 0
-	}
-	return len(raw) + 1
-}
-
-// dropLeadingAssistantUnlessActive removes leading assistant messages from a
-// truncated history tail unless the first assistant is the active tool-use turn
-// answered by the current message's toolResults. Dropping that active assistant
-// leaves orphaned current toolResults, which causes the next turn to lose tool
-// state.
-func dropLeadingAssistantUnlessActive(tail []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
-	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
-		if assistantToolUsesCoveredByIDs(tail[0], currentToolResultIDs) {
-			break
-		}
-		tail = tail[1:]
-	}
-	return tail
-}
-
-func currentMessageToolResultIDs(payload *KiroPayload) map[string]bool {
-	if payload == nil {
-		return nil
-	}
-	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
-	if ctx == nil {
-		return nil
-	}
-	return collectToolResultIDs(ctx.ToolResults)
-}
-
-func assistantToolUsesCoveredByIDs(msg KiroHistoryMessage, ids map[string]bool) bool {
-	if len(ids) == 0 || msg.AssistantResponseMessage == nil || len(msg.AssistantResponseMessage.ToolUses) == 0 {
-		return false
-	}
-	for _, tu := range msg.AssistantResponseMessage.ToolUses {
-		if !ids[tu.ToolUseID] {
-			return false
-		}
-	}
-	return true
-}
-
-func repairCurrentToolResultPairing(payload *KiroPayload) {
-	if payload == nil {
-		return
-	}
-	ids := currentMessageToolResultIDs(payload)
-	if len(ids) == 0 {
-		return
-	}
-	if currentToolResultsMatchLastAssistant(payload.ConversationState.History, ids) {
-		return
-	}
-
-	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	ctx := cur.UserInputMessageContext
-	if ctx == nil || len(ctx.ToolResults) == 0 {
-		return
-	}
-
-	narrated := buildToolResultsContinuation(ctx.ToolResults)
-	if strings.TrimSpace(narrated) != "" && !strings.Contains(cur.Content, toolResultsContinuationPrefix) {
-		cur.Content = joinHistoryText(cur.Content, narrated)
-	}
-	ctx.ToolResults = nil
-	if len(ctx.Tools) == 0 {
-		cur.UserInputMessageContext = nil
-	}
-}
-
-// payloadByteSize returns the serialized size of the payload in bytes.
-func payloadByteSize(payload *KiroPayload) int {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return 0
-	}
-	return len(raw)
-}
-
-func currentMessageModelID(payload *KiroPayload) string {
-	return payload.ConversationState.CurrentMessage.UserInputMessage.ModelID
-}
-
-// truncateCurrentMessage hard-truncates the current message as a last resort
-// when even the minimal retained history plus current message exceeds the limit.
-//
-// The current message can be oversized for three independent reasons: large text
-// Content, large base64 Images/Documents, or large structured ToolResults.
-// Shrinking only Content (the previous behavior) silently failed whenever the
-// bulk lived in attachments or ToolResults — overhead alone exceeded
-// maxPayloadBytes, Content was clamped to "." yet the payload stayed over-limit
-// and upstream returned HTTP 400.
-//
-// We now trim in order of least to most semantically important: first drop
-// attachments (heaviest, least recoverable), then shrink tool-result text, and
-// only then shrink Content. All string trims are UTF-8 boundary-safe so the
-// resulting JSON never contains a split multi-byte rune.
-func truncateCurrentMessage(payload *KiroPayload) {
-	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-
-	// 1) Drop attachments first — base64 bytes are large and cannot be partially kept.
-	if len(cur.Images) > 0 && payloadByteSize(payload) > maxPayloadBytes {
-		cur.Images = nil
-	}
-	if len(cur.Documents) > 0 && payloadByteSize(payload) > maxPayloadBytes {
-		cur.Documents = nil
-	}
-
-	// 2) Shrink structured tool-result text if the payload is still too large.
-	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
-		shrinkToolResultsToLimit(payload)
-	}
-
-	// 3) Finally shrink Content. Recompute overhead each time since steps 1-2
-	//    changed the payload size.
-	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
-	if budget < 0 {
-		budget = 0
-	}
-	if len(cur.Content) > budget {
-		if budget == 0 {
-			cur.Content = minimalFallbackUserContent
-			return
-		}
-		cur.Content = truncateUTF8(cur.Content, budget)
-	}
-}
-
-// shrinkToolResultsToLimit reduces the serialized size of the current message's
-// tool results until the whole payload fits. It trims each result's text content
-// proportionally, then clears it entirely if that is still not enough, always
-// respecting UTF-8 boundaries.
-func shrinkToolResultsToLimit(payload *KiroPayload) {
-	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
-	if cur.UserInputMessageContext == nil {
-		return
-	}
-	results := cur.UserInputMessageContext.ToolResults
-
-	for i := range results {
-		if payloadByteSize(payload) <= maxPayloadBytes {
-			return
-		}
-		for j := range results[i].Content {
-			text := results[i].Content[j].Text
-			if text == "" {
-				continue
-			}
-			overhead := payloadByteSize(payload) - len(text)
-			budget := maxPayloadBytes - overhead
-			if budget <= 0 {
-				results[i].Content[j].Text = ""
-				continue
-			}
-			if len(text) > budget {
-				results[i].Content[j].Text = truncateUTF8(text, budget)
-			}
-		}
-	}
-}
-
-// truncateUTF8 returns the longest prefix of s whose byte length is <= maxBytes
-// without splitting a multi-byte rune. Slicing a Go string at an arbitrary byte
-// index can land mid-rune, producing invalid UTF-8 that json.Marshal escapes
-// into a replacement character — or, worse, that upstream rejects as malformed.
-func truncateUTF8(s string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(s) <= maxBytes {
-		return s
-	}
-	cut := maxBytes
-	// Walk back to the start of the rune that straddles the cut point.
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

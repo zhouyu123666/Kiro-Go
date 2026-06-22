@@ -535,6 +535,7 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
+		"tokenLimits":      map[string]int{"maxInputTokens": maxKiroInputTokens},
 		"supports_image":   supportsImage,
 		"input_modalities": modalities,
 		"modalities":       modalitiesMap,
@@ -812,6 +813,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
+		return
+	}
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	// 转换请求
@@ -1502,6 +1507,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
+		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
+		return
+	}
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 

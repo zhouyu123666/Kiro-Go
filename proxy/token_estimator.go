@@ -3,7 +3,10 @@ package proxy
 import (
 	"encoding/json"
 	"math"
+	"unicode"
 )
+
+const claudeTokenCorrectionFactor = 1.15
 
 func estimateApproxTokens(text string) int {
 	if text == "" {
@@ -33,17 +36,52 @@ func estimateApproxTokens(text string) int {
 		}
 	}
 
-	estimated := int(math.Ceil(
+	charClassEstimate := int(math.Ceil(
 		float64(regularAscii)/4.5 +
 			float64(digits)/2.0 +
 			float64(symbols)/1.5 +
 			float64(nonASCII)/1.5,
 	))
 
+	lexicalEstimate := estimateLexicalTokenFloor(runes)
+	estimated := max(charClassEstimate, lexicalEstimate)
+	estimated = int(math.Ceil(float64(estimated) * claudeTokenCorrectionFactor))
+
 	if estimated < 1 {
 		return 1
 	}
 	return estimated
+}
+
+func estimateLexicalTokenFloor(runes []rune) int {
+	tokens := 0
+	inWord := false
+	for _, r := range runes {
+		if isASCIILetter(r) {
+			if !inWord {
+				tokens++
+				inWord = true
+			}
+			continue
+		}
+		inWord = false
+
+		switch {
+		case unicode.IsSpace(r):
+			continue
+		case r >= '0' && r <= '9':
+			tokens++
+		case r >= 0x80:
+			tokens++
+		default:
+			tokens++
+		}
+	}
+	return tokens
+}
+
+func isASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
 
 func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
