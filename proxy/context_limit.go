@@ -3,11 +3,13 @@ package proxy
 import "fmt"
 
 const maxKiroInputTokens = 200_000
+const clientKiroInputTokens = 180_000
+const maxKiroEstimatedInputTokens = int(maxKiroInputTokens * claudeTokenCorrectionFactor)
 
 const contextLimitMessage = "Model context limit reached. Conversation size exceeds model capacity."
 
 func exceedsKiroInputTokenLimit(estimatedInputTokens int) bool {
-	return estimatedInputTokens > maxKiroInputTokens
+	return estimatedInputTokens > maxKiroEstimatedInputTokens
 }
 
 func contextLimitErrorMessage(estimatedInputTokens int) string {

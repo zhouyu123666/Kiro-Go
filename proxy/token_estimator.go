@@ -33,30 +33,8 @@ func estimateApproxTokens(text string) int {
 		return max(1, int(math.Ceil(float64(length)/3.0)))
 	}
 
-	var regularAscii, digits, symbols, nonASCII int
-	for _, r := range runes {
-		switch {
-		case r >= 0x80:
-			nonASCII++
-		case r >= '0' && r <= '9':
-			digits++
-		case (r >= '!' && r <= '/') || (r >= ':' && r <= '@') || (r >= '[' && r <= '`') || (r >= '{' && r <= '~'):
-			symbols++
-		default:
-			regularAscii++
-		}
-	}
-
-	charClassEstimate := int(math.Ceil(
-		float64(regularAscii)/4.5 +
-			float64(digits)/2.0 +
-			float64(symbols)/1.5 +
-			float64(nonASCII)/1.5,
-	))
-
 	lexicalEstimate := estimateLexicalTokenFloor(runes)
-	estimated := max(charClassEstimate, lexicalEstimate)
-	estimated = int(math.Ceil(float64(estimated) * claudeTokenCorrectionFactor))
+	estimated := int(math.Ceil(float64(lexicalEstimate) * claudeTokenCorrectionFactor))
 
 	if estimated < 1 {
 		return 1
@@ -66,16 +44,21 @@ func estimateApproxTokens(text string) int {
 
 func estimateLexicalTokenFloor(runes []rune) int {
 	tokens := 0
-	inWord := false
+	asciiWordLen := 0
+	flushASCIIWord := func() {
+		if asciiWordLen == 0 {
+			return
+		}
+		tokens += estimateASCIIWordTokens(asciiWordLen)
+		asciiWordLen = 0
+	}
+
 	for _, r := range runes {
 		if isASCIILetter(r) {
-			if !inWord {
-				tokens++
-				inWord = true
-			}
+			asciiWordLen++
 			continue
 		}
-		inWord = false
+		flushASCIIWord()
 
 		switch {
 		case unicode.IsSpace(r):
@@ -88,7 +71,18 @@ func estimateLexicalTokenFloor(runes []rune) int {
 			tokens++
 		}
 	}
+	flushASCIIWord()
 	return tokens
+}
+
+func estimateASCIIWordTokens(length int) int {
+	if length <= 0 {
+		return 0
+	}
+	if length <= 12 {
+		return 1
+	}
+	return int(math.Ceil(float64(length) / 6.0))
 }
 
 func isASCIILetter(r rune) bool {

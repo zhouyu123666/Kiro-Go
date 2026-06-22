@@ -123,14 +123,33 @@ func TestResponsesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	assertContextLimitError(t, rr)
 }
 
-func TestBuildModelInfoAdvertisesKiroInputLimit(t *testing.T) {
+func TestBuildModelInfoAdvertisesClientCompactionLimit(t *testing.T) {
 	model := buildModelInfo("claude-opus-4.7", "anthropic", true)
 	tokenLimits, ok := model["tokenLimits"].(map[string]int)
 	if !ok {
 		t.Fatalf("expected tokenLimits on model info, got %#v", model["tokenLimits"])
 	}
-	if tokenLimits["maxInputTokens"] != maxKiroInputTokens {
-		t.Fatalf("expected maxInputTokens=%d, got %d", maxKiroInputTokens, tokenLimits["maxInputTokens"])
+	if tokenLimits["maxInputTokens"] != clientKiroInputTokens {
+		t.Fatalf("expected maxInputTokens=%d, got %d", clientKiroInputTokens, tokenLimits["maxInputTokens"])
+	}
+}
+
+func TestClientCompactionLimitLeavesHeadroomBeforeHardLimit(t *testing.T) {
+	if clientKiroInputTokens >= maxKiroInputTokens {
+		t.Fatalf("client limit %d must stay below hard limit %d", clientKiroInputTokens, maxKiroInputTokens)
+	}
+	if exceedsKiroInputTokenLimit(clientKiroInputTokens + 1) {
+		t.Fatalf("client compaction headroom must not be treated as a hard reject")
+	}
+}
+
+func TestEstimatorSafetyFactorDoesNotBlockCompactionHeadroom(t *testing.T) {
+	estimated := estimateApproxTokens(strings.Repeat("context ", 185_000))
+	if estimated <= maxKiroInputTokens {
+		t.Fatalf("test setup expected corrected estimate above hard limit, got %d", estimated)
+	}
+	if exceedsKiroInputTokenLimit(estimated) {
+		t.Fatalf("corrected estimate %d should remain inside hard-limit safety margin", estimated)
 	}
 }
 

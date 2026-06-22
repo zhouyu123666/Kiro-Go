@@ -535,7 +535,7 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
-		"tokenLimits":      map[string]int{"maxInputTokens": maxKiroInputTokens},
+		"tokenLimits":      map[string]int{"maxInputTokens": clientKiroInputTokens},
 		"supports_image":   supportsImage,
 		"input_modalities": modalities,
 		"modalities":       modalitiesMap,
