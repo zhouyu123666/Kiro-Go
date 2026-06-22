@@ -115,6 +115,62 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	return total
 }
 
+// estimateKiroPayloadInputTokens estimates the input tokens of the exact payload
+// that will be sent upstream. This is what the 200k limit check should use: it
+// accounts for PDF text inlined into message content, the system prompt re-emitted
+// as priming history, tool-spec deduplication, and tool-result flattening — none
+// of which are visible when estimating the raw client request. Estimating the raw
+// request can under- or over-count relative to the wire body (most importantly,
+// a text-heavy PDF is ~3k as a document block but ~15k once inlined), so gating on
+// the payload keeps our local check aligned with what Kiro actually receives.
+func estimateKiroPayloadInputTokens(payload *KiroPayload) int {
+	if payload == nil {
+		return 0
+	}
+
+	total := estimateKiroUserMessageTokens(&payload.ConversationState.CurrentMessage.UserInputMessage)
+
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil {
+			total += estimateKiroUserMessageTokens(h.UserInputMessage)
+		}
+		if h.AssistantResponseMessage != nil {
+			total += estimateApproxTokens(h.AssistantResponseMessage.Content)
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				total += estimateApproxTokens(tu.Name)
+				total += estimateJSONTokens(tu.Input)
+			}
+		}
+	}
+
+	return total
+}
+
+func estimateKiroUserMessageTokens(msg *KiroUserInputMessage) int {
+	if msg == nil {
+		return 0
+	}
+
+	total := estimateApproxTokens(msg.Content)
+	total += len(msg.Images) * approxImageInputTokens
+	total += len(msg.Documents) * approxDocumentInputTokens
+
+	if ctx := msg.UserInputMessageContext; ctx != nil {
+		for _, tool := range ctx.Tools {
+			total += estimateApproxTokens(tool.ToolSpecification.Name)
+			total += estimateApproxTokens(tool.ToolSpecification.Description)
+			total += estimateJSONTokens(tool.ToolSpecification.InputSchema.JSON)
+		}
+		for _, tr := range ctx.ToolResults {
+			for _, c := range tr.Content {
+				total += estimateApproxTokens(c.Text)
+			}
+		}
+	}
+
+	return total
+}
+
 func estimateClaudeOutputTokens(content, thinkingContent string, toolUses []KiroToolUse) int {
 	total := estimateApproxTokens(content)
 	total += estimateApproxTokens(thinkingContent)

@@ -812,15 +812,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
-	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+
+	// 转换请求
+	kiroPayload := ClaudeToKiro(&req, thinking)
+
+	// Gate on the converted payload (the exact upstream body) so PDF inlining,
+	// system priming and tool dedup are reflected in the estimate.
+	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
 	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
 		return
 	}
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
-
-	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -1506,13 +1509,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+
+	kiroPayload := OpenAIToKiro(&req, thinking)
+
+	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
 	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
 		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
 		return
 	}
-
-	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {

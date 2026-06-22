@@ -211,6 +211,49 @@ func TestOpenAIImageContentDoesNotTripInputLimit(t *testing.T) {
 	}
 }
 
+// A PDF arrives as a small document block but inlinePDFDocuments folds its
+// extracted text into the current message content during conversion. Gating on
+// the converted payload must count that inlined text, otherwise a near-limit
+// conversation plus a text-heavy PDF slips past the local check and trips
+// Kiro's "Input is too long." rejection upstream.
+func TestKiroPayloadCountsInlinedMessageContent(t *testing.T) {
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: oversizedInputText(),
+	}
+	if got := estimateKiroPayloadInputTokens(payload); got <= maxKiroInputTokens {
+		t.Fatalf("expected inlined content to exceed %d tokens, got %d", maxKiroInputTokens, got)
+	}
+}
+
+func TestKiroPayloadMediaUsesFixedCost(t *testing.T) {
+	payload := &KiroPayload{}
+	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
+	cur.Content = "describe these"
+	cur.Images = []KiroImage{{Format: "png"}, {Format: "png"}}
+	cur.Documents = []KiroDocument{{Format: "pdf"}}
+	cur.Images[0].Source.Bytes = largeBase64()
+	cur.Images[1].Source.Bytes = largeBase64()
+	cur.Documents[0].Source.Bytes = largeBase64()
+
+	want := estimateApproxTokens("describe these") + 2*approxImageInputTokens + approxDocumentInputTokens
+	if got := estimateKiroPayloadInputTokens(payload); got != want {
+		t.Fatalf("expected media to use fixed cost (%d), got %d", want, got)
+	}
+}
+
+func TestKiroPayloadCountsHistory(t *testing.T) {
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{Content: "final turn"}
+	payload.ConversationState.History = []KiroHistoryMessage{
+		{UserInputMessage: &KiroUserInputMessage{Content: oversizedInputText()}},
+		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "ok"}},
+	}
+	if got := estimateKiroPayloadInputTokens(payload); got <= maxKiroInputTokens {
+		t.Fatalf("expected history to push payload over %d tokens, got %d", maxKiroInputTokens, got)
+	}
+}
+
 func assertContextLimitError(t *testing.T, rr *httptest.ResponseRecorder) {
 	t.Helper()
 	if rr.Code != http.StatusBadRequest {

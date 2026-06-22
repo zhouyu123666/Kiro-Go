@@ -108,12 +108,13 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
+	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+
+	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
 	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
 		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
 		return
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
