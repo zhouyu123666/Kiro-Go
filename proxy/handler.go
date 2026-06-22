@@ -19,6 +19,22 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// RequestLog stores details about a single API request (success or failure).
+type RequestLog struct {
+	Time      int64  `json:"time"`      // Unix timestamp
+	Endpoint  string `json:"endpoint"`  // claude/openai/responses
+	Model     string `json:"model"`     // Requested model
+	AccountID string `json:"accountId"` // Account used
+	Status    string `json:"status"`    // "success" or "error"
+	Error     string `json:"error"`     // Error message (empty on success)
+	ErrorType string `json:"errorType"` // Error category (empty on success)
+	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
+	Duration  int64  `json:"duration"`  // Request duration in ms
+}
+
+const requestLogsMaxSize = 500
+
 // Handler HTTP 处理器
 type Handler struct {
 	pool *pool.AccountPool
@@ -38,6 +54,9 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
+	// 请求日志 (环形缓冲区，包含成功和失败)
+	requestLogs   []RequestLog
+	requestLogsMu sync.RWMutex
 }
 
 type thinkingStreamSource int
@@ -849,6 +868,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
+	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
@@ -1213,7 +1233,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
-			h.recordFailure()
+			h.recordFailureWithDetails("claude", model, account.ID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1246,6 +1266,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1272,7 +1293,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailure()
+	h.recordFailureWithDetails("claude", model, "", lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1344,15 +1365,96 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
-func (h *Handler) recordFailure() {
+// recordFailureWithDetails records a failure and stores it in the request logs.
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
+
+	if err == nil {
+		return
+	}
+
+	errMsg := err.Error()
+	errType := classifyError(errMsg)
+
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		Status:    "error",
+		Error:     errMsg,
+		ErrorType: errType,
+	}
+
+	h.appendRequestLog(entry)
+}
+
+// recordSuccessLog records a successful request in the request logs.
+func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		Status:    "success",
+		Tokens:    tokens,
+		Credits:   credits,
+		Duration:  durationMs,
+	}
+
+	h.appendRequestLog(entry)
+}
+
+func (h *Handler) appendRequestLog(entry RequestLog) {
+	h.requestLogsMu.Lock()
+	if h.requestLogs == nil {
+		h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
+	}
+	if len(h.requestLogs) >= requestLogsMaxSize {
+		h.requestLogs = h.requestLogs[1:]
+	}
+	h.requestLogs = append(h.requestLogs, entry)
+	h.requestLogsMu.Unlock()
+}
+
+// classifyError categorizes an error message into a type for display.
+func classifyError(msg string) string {
+	switch {
+	case isQuotaErrorMessage(msg):
+		return "quota"
+	case isOverageErrorMessage(msg):
+		return "overage"
+	case isSuspensionErrorMessage(msg):
+		return "suspended"
+	case isAuthErrorMessage(msg):
+		return "auth"
+	case isProfileUnavailableErrorMessage(msg):
+		return "profile"
+	default:
+		return "unknown"
+	}
+}
+
+// getRequestLogs returns a copy of request logs (newest first).
+func (h *Handler) getRequestLogs() []RequestLog {
+	h.requestLogsMu.RLock()
+	defer h.requestLogsMu.RUnlock()
+	if len(h.requestLogs) == 0 {
+		return []RequestLog{}
+	}
+	result := make([]RequestLog, len(h.requestLogs))
+	for i, e := range h.requestLogs {
+		result[len(h.requestLogs)-1-i] = e
+	}
+	return result
 }
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
@@ -1426,6 +1528,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1465,7 +1568,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailure()
+	h.recordFailureWithDetails("claude", model, "", lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1544,6 +1647,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
@@ -1846,7 +1950,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
-			h.recordFailure()
+			h.recordFailureWithDetails("openai", model, account.ID, err)
 			return
 		}
 
@@ -1877,6 +1981,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -1911,7 +2016,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailure()
+	h.recordFailureWithDetails("openai", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -1919,6 +2024,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
@@ -1980,6 +2086,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -1993,7 +2100,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailure()
+	h.recordFailureWithDetails("openai", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2136,6 +2243,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/logs" && r.Method == "GET":
+		h.apiGetLogs(w, r)
+	case path == "/logs" && r.Method == "DELETE":
+		h.apiClearLogs(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":
 		h.apiGenerateMachineId(w, r)
 	case path == "/thinking" && r.Method == "GET":
@@ -2966,6 +3077,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
 		"totalRequests":   h.totalRequests,
@@ -3083,6 +3195,19 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
 	config.UpdateStats(0, 0, 0, 0, 0)
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs": h.getRequestLogs(),
+	})
+}
+
+func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
+	h.requestLogsMu.Lock()
+	h.requestLogs = h.requestLogs[:0]
+	h.requestLogsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
