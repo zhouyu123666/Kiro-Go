@@ -3,6 +3,20 @@ package proxy
 import (
 	"encoding/json"
 	"math"
+	"unicode"
+)
+
+const claudeTokenCorrectionFactor = 1.15
+
+// Binary media (images, documents) is sent to the model as attachments, not as
+// the raw base64 string in the request body. Estimating these blocks by JSON-
+// marshalling them would count the base64 payload (~bytes/4 tokens), which makes
+// even a modest image look like hundreds of thousands of tokens and trips the
+// input limit before the request reaches upstream. Use fixed per-attachment
+// estimates that approximate the model's actual accounting instead.
+const (
+	approxImageInputTokens    = 1600
+	approxDocumentInputTokens = 3000
 )
 
 func estimateApproxTokens(text string) int {
@@ -19,31 +33,60 @@ func estimateApproxTokens(text string) int {
 		return max(1, int(math.Ceil(float64(length)/3.0)))
 	}
 
-	var regularAscii, digits, symbols, nonASCII int
-	for _, r := range runes {
-		switch {
-		case r >= 0x80:
-			nonASCII++
-		case r >= '0' && r <= '9':
-			digits++
-		case (r >= '!' && r <= '/') || (r >= ':' && r <= '@') || (r >= '[' && r <= '`') || (r >= '{' && r <= '~'):
-			symbols++
-		default:
-			regularAscii++
-		}
-	}
-
-	estimated := int(math.Ceil(
-		float64(regularAscii)/4.5 +
-			float64(digits)/2.0 +
-			float64(symbols)/1.5 +
-			float64(nonASCII)/1.5,
-	))
+	lexicalEstimate := estimateLexicalTokenFloor(runes)
+	estimated := int(math.Ceil(float64(lexicalEstimate) * claudeTokenCorrectionFactor))
 
 	if estimated < 1 {
 		return 1
 	}
 	return estimated
+}
+
+func estimateLexicalTokenFloor(runes []rune) int {
+	tokens := 0
+	asciiWordLen := 0
+	flushASCIIWord := func() {
+		if asciiWordLen == 0 {
+			return
+		}
+		tokens += estimateASCIIWordTokens(asciiWordLen)
+		asciiWordLen = 0
+	}
+
+	for _, r := range runes {
+		if isASCIILetter(r) {
+			asciiWordLen++
+			continue
+		}
+		flushASCIIWord()
+
+		switch {
+		case unicode.IsSpace(r):
+			continue
+		case r >= '0' && r <= '9':
+			tokens++
+		case r >= 0x80:
+			tokens++
+		default:
+			tokens++
+		}
+	}
+	flushASCIIWord()
+	return tokens
+}
+
+func estimateASCIIWordTokens(length int) int {
+	if length <= 0 {
+		return 0
+	}
+	if length <= 12 {
+		return 1
+	}
+	return int(math.Ceil(float64(length) / 6.0))
+}
+
+func isASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
 
 func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
@@ -61,6 +104,62 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 		total += estimateApproxTokens(tool.Name)
 		total += estimateApproxTokens(tool.Description)
 		total += estimateJSONTokens(tool.InputSchema)
+	}
+
+	return total
+}
+
+// estimateKiroPayloadInputTokens estimates the input tokens of the exact payload
+// that will be sent upstream. This is what the 200k limit check should use: it
+// accounts for PDF text inlined into message content, the system prompt re-emitted
+// as priming history, tool-spec deduplication, and tool-result flattening — none
+// of which are visible when estimating the raw client request. Estimating the raw
+// request can under- or over-count relative to the wire body (most importantly,
+// a text-heavy PDF is ~3k as a document block but ~15k once inlined), so gating on
+// the payload keeps our local check aligned with what Kiro actually receives.
+func estimateKiroPayloadInputTokens(payload *KiroPayload) int {
+	if payload == nil {
+		return 0
+	}
+
+	total := estimateKiroUserMessageTokens(&payload.ConversationState.CurrentMessage.UserInputMessage)
+
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil {
+			total += estimateKiroUserMessageTokens(h.UserInputMessage)
+		}
+		if h.AssistantResponseMessage != nil {
+			total += estimateApproxTokens(h.AssistantResponseMessage.Content)
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				total += estimateApproxTokens(tu.Name)
+				total += estimateJSONTokens(tu.Input)
+			}
+		}
+	}
+
+	return total
+}
+
+func estimateKiroUserMessageTokens(msg *KiroUserInputMessage) int {
+	if msg == nil {
+		return 0
+	}
+
+	total := estimateApproxTokens(msg.Content)
+	total += len(msg.Images) * approxImageInputTokens
+	total += len(msg.Documents) * approxDocumentInputTokens
+
+	if ctx := msg.UserInputMessageContext; ctx != nil {
+		for _, tool := range ctx.Tools {
+			total += estimateApproxTokens(tool.ToolSpecification.Name)
+			total += estimateApproxTokens(tool.ToolSpecification.Description)
+			total += estimateJSONTokens(tool.ToolSpecification.InputSchema.JSON)
+		}
+		for _, tr := range ctx.ToolResults {
+			for _, c := range tr.Content {
+				total += estimateApproxTokens(c.Text)
+			}
+		}
 	}
 
 	return total
@@ -116,6 +215,10 @@ func estimateClaudeValueTokens(v interface{}) int {
 			if content, ok := value["content"]; ok {
 				return estimateClaudeValueTokens(content)
 			}
+		case "image", "image_url", "input_image":
+			return approxImageInputTokens
+		case "document", "input_file", "file":
+			return approxDocumentInputTokens
 		}
 
 		total := 0
@@ -182,11 +285,33 @@ func estimateOpenAIContentTokens(content interface{}) int {
 		return 0
 	case string:
 		return estimateApproxTokens(value)
-	default:
-		text := extractOpenAIMessageText(value)
-		if text != "" {
+	case []interface{}:
+		total := 0
+		for _, part := range value {
+			total += estimateOpenAIContentTokens(part)
+		}
+		return total
+	case map[string]interface{}:
+		switch partType, _ := value["type"].(string); partType {
+		case "text", "input_text", "output_text":
+			if text, ok := value["text"].(string); ok {
+				return estimateApproxTokens(text)
+			}
+		case "image", "image_url", "input_image":
+			return approxImageInputTokens
+		case "file", "input_file", "document":
+			return approxDocumentInputTokens
+		}
+		if nested, ok := value["content"]; ok {
+			if n := estimateOpenAIContentTokens(nested); n > 0 {
+				return n
+			}
+		}
+		if text, ok := value["text"].(string); ok {
 			return estimateApproxTokens(text)
 		}
+		return estimateJSONTokens(value)
+	default:
 		return estimateJSONTokens(value)
 	}
 }
