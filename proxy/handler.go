@@ -21,16 +21,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -813,6 +813,30 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
+
+	var rawReq ClaudeRequest
+	if err := json.Unmarshal(body, &rawReq); err != nil {
+		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
+		return
+	}
+	if msg := validateClaudeRequestShape(&rawReq); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
+	clientModel := rawReq.Model
+	rawEstimatedInputTokens := estimateClaudeCompactionInputTokens(&rawReq)
+	rawExceedsClientLimit := exceedsClientCompactionLimit(rawEstimatedInputTokens)
+	logger.Debugf("[ClaudeContextGate] stage=raw model=%s stream=%t estimatedInputTokens=%d clientLimit=%d exceedsClientLimit=%t",
+		clientModel, rawReq.Stream, rawEstimatedInputTokens, clientKiroInputTokens, rawExceedsClientLimit)
+	if rawExceedsClientLimit {
+		msg := promptTooLongErrorMessage(rawEstimatedInputTokens)
+		logger.Warnf("[ClaudeContextGate] rejecting prompt-too-long stage=raw model=%s estimatedInputTokens=%d clientLimit=%d message=%q",
+			clientModel, rawEstimatedInputTokens, clientKiroInputTokens, msg)
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", msg)
+		return
+	}
+
 	body = maybeCompressRequestBody(body)
 
 	var req ClaudeRequest
@@ -838,7 +862,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Gate on the converted payload (the exact upstream body) so PDF inlining,
 	// system priming and tool dedup are reflected in the estimate.
 	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
-	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
+	current := kiroPayload.ConversationState.CurrentMessage.UserInputMessage
+	currentTools := 0
+	currentToolResults := 0
+	if current.UserInputMessageContext != nil {
+		currentTools = len(current.UserInputMessageContext.Tools)
+		currentToolResults = len(current.UserInputMessageContext.ToolResults)
+	}
+	exceedsHardLimit := exceedsKiroInputTokenLimit(estimatedInputTokens)
+	logger.Debugf("[ClaudeContextGate] stage=kiroPayload model=%s actualModel=%s stream=%t estimatedInputTokens=%d hardLimit=%d exceedsHardLimit=%t history=%d currentContentChars=%d currentTools=%d currentToolResults=%d",
+		clientModel, req.Model, req.Stream, estimatedInputTokens, maxKiroInputTokens, exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
+	if exceedsHardLimit {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
 		return
 	}
@@ -846,15 +880,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	usageReportWindow := getClaudeCodeUsageReportWindow(clientModel)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1221,7 +1256,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
 			},
 		}
 
@@ -1451,7 +1486,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1495,7 +1530,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
 			},
 		}
 
@@ -1608,6 +1643,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientModel := req.Model
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
@@ -1622,15 +1659,16 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	usageReportWindow := getClaudeCodeUsageReportWindow(clientModel)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1938,7 +1976,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
 			},
 		}
 
@@ -2021,7 +2059,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2057,7 +2095,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
 			},
 		}
 

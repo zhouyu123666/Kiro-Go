@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -21,6 +22,10 @@ func TestMain(m *testing.M) {
 
 func oversizedInputText() string {
 	return strings.Repeat("context ", maxKiroInputTokens+1)
+}
+
+func clientCompactionInputText() string {
+	return strings.Repeat("context ", 185_000)
 }
 
 func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
@@ -64,10 +69,11 @@ func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
 }
 
 func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
+	content := oversizedInputText()
 	body, err := json.Marshal(ClaudeRequest{
 		Model: "claude-opus-4.7",
 		Messages: []ClaudeMessage{
-			{Role: "user", Content: oversizedInputText()},
+			{Role: "user", Content: content},
 		},
 	})
 	if err != nil {
@@ -80,7 +86,36 @@ func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rr, req)
 
-	assertContextLimitError(t, rr)
+	assertPromptTooLongError(t, rr, estimateApproxTokens(content))
+}
+
+func TestClaudeMessagesOverClientCompactionLimitReturnsPromptTooLong(t *testing.T) {
+	content := clientCompactionInputText()
+	estimated := estimateApproxTokens(content)
+	if estimated <= clientKiroInputTokens {
+		t.Fatalf("test input should exceed client compaction limit %d, estimated %d", clientKiroInputTokens, estimated)
+	}
+	if exceedsKiroInputTokenLimit(estimated) {
+		t.Fatalf("test input should stay below hard safety limit, estimated %d", estimated)
+	}
+
+	body, err := json.Marshal(ClaudeRequest{
+		Model: "claude-opus-4.7",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: content},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
+
+	h := &Handler{}
+	h.handleClaudeMessagesInternal(rr, req)
+
+	assertPromptTooLongError(t, rr, estimated)
 }
 
 func TestOpenAIChatRejectsOverKiroInputTokenLimit(t *testing.T) {
@@ -288,5 +323,32 @@ func assertContextLimitError(t *testing.T, rr *httptest.ResponseRecorder) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected response to contain %q, got %s", want, body)
 		}
+	}
+}
+
+func assertPromptTooLongError(t *testing.T, rr *httptest.ResponseRecorder, estimatedInputTokens int) {
+	t.Helper()
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d with body %s", rr.Code, rr.Body.String())
+	}
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("decode response body: %v; body=%s", err, rr.Body.String())
+	}
+	body := parsed.Error.Message
+	for _, want := range []string{
+		"Prompt is too long",
+		"tokens > 180000 maximum",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected response to contain %q, got %s", want, body)
+		}
+	}
+	if !strings.Contains(body, strconv.Itoa(estimatedInputTokens)) {
+		t.Fatalf("expected response to contain estimated token count %d, got %s", estimatedInputTokens, body)
 	}
 }

@@ -125,6 +125,41 @@ func TestRTKCompressesMultiTurnClaudeCodeSessionBeforeUpstreamKiroRequest(t *tes
 	}
 }
 
+func TestClaudeCompactionGateUsesRawRequestBeforeRTKCompression(t *testing.T) {
+	t.Setenv("KIRO_GO_RTK", "true")
+	t.Setenv("KIRO_GO_RTK_MIN_BYTES", "1")
+
+	searchOutput := rtkIntegrationGrepOutputFrom("proxy/handler.go", 200, 18_000, "raw-limit")
+	requestBody := string(multiTurnClaudeCodeRequest(t, searchOutput, "", "final question"))
+
+	var rawReq ClaudeRequest
+	if err := json.Unmarshal([]byte(requestBody), &rawReq); err != nil {
+		t.Fatalf("decode raw request: %v", err)
+	}
+	rawEstimate := estimateClaudeCompactionInputTokens(&rawReq)
+	if rawEstimate <= clientKiroInputTokens {
+		t.Fatalf("test setup expected raw request estimate to exceed %d, got %d", clientKiroInputTokens, rawEstimate)
+	}
+
+	compressed := maybeCompressRequestBody([]byte(requestBody))
+	var compressedReq ClaudeRequest
+	if err := json.Unmarshal(compressed, &compressedReq); err != nil {
+		t.Fatalf("decode compressed request: %v", err)
+	}
+	compressedPayload := ClaudeToKiro(&compressedReq, false)
+	compressedEstimate := estimateKiroPayloadInputTokens(compressedPayload)
+	if compressedEstimate >= clientKiroInputTokens {
+		t.Fatalf("test setup expected compressed Kiro payload estimate below %d, got %d", clientKiroInputTokens, compressedEstimate)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
+	rec := httptest.NewRecorder()
+	h := &Handler{}
+	h.handleClaudeMessages(rec, req)
+
+	assertPromptTooLongError(t, rec, rawEstimate)
+}
+
 func TestRTKCompressesMultiTurnOpenAIChatSessionBeforeUpstreamKiroRequest(t *testing.T) {
 	t.Setenv("KIRO_GO_RTK_MIN_BYTES", "1")
 
