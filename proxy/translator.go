@@ -300,19 +300,40 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether the current tool results form a valid "active" tool turn:
-	// the last history assistant must carry matching structured toolUses. If not
-	// (orphaned tool results, e.g. after context compaction), flatten them into
-	// the current message text so the upstream does not reject the request.
-	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	// Convert tools before history sanitization so completed tool turns in history
+	// can remain structured when we have enough tool metadata for Kiro to accept
+	// them. Without tools, fall back to the older text-only history path.
+	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
+	if len(kiroTools) > 0 {
+		normalizeHistoryToolUseNames(history, claudeToolNameLookup(req.Tools))
+	}
 
-	// Flatten structured tool calls/results that live in history; upstream only
-	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+	keepCurrentToolResults := false
+	preserveHistoryTools := shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
+	if preserveHistoryTools {
+		validatedToolResults, orphanedToolUseIDs := validateStructuredToolHistory(history, currentToolResults)
+		if len(validatedToolResults) == len(currentToolResults) {
+			currentToolResults = validatedToolResults
+			removeOrphanedToolUses(history, orphanedToolUseIDs)
+			kiroTools = appendMissingPlaceholderTools(kiroTools, collectHistoryToolNames(history))
+			keepCurrentToolResults = len(currentToolResults) > 0
+			history = sanitizeKiroHistory(history, collectToolResultIDs(currentToolResults), true)
+		} else {
+			preserveHistoryTools = false
+		}
+	}
+	if !preserveHistoryTools {
+		// Decide whether the current tool results form a valid "active" tool turn:
+		// the last history assistant must carry matching structured toolUses. If not
+		// (orphaned tool results, e.g. after context compaction), flatten them into
+		// the current message text so the upstream does not reject the request.
+		currentToolResultIDs := collectToolResultIDs(currentToolResults)
+		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs, false)
+		} else {
+			history = sanitizeKiroHistory(history, nil, false)
+		}
 	}
 
 	// 构建最终内容
@@ -330,9 +351,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else {
 		finalContent = minimalFallbackUserContent
 	}
-
-	// 转换工具
-	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -1094,6 +1112,173 @@ func shortenToolName(name string) string {
 	return name[:64]
 }
 
+func claudeToolNameLookup(tools []ClaudeTool) map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make(map[string]string, len(tools)*2)
+	for _, tool := range tools {
+		kiroName := shortenToolName(sanitizeToolName(tool.Name))
+		if strings.TrimSpace(kiroName) == "" {
+			continue
+		}
+		names[tool.Name] = kiroName
+		names[kiroName] = kiroName
+	}
+	return names
+}
+
+func normalizeHistoryToolUseNames(history []KiroHistoryMessage, names map[string]string) {
+	if len(names) == 0 {
+		return
+	}
+	for i := range history {
+		msg := history[i].AssistantResponseMessage
+		if msg == nil {
+			continue
+		}
+		for j := range msg.ToolUses {
+			if mapped := names[msg.ToolUses[j].Name]; mapped != "" {
+				msg.ToolUses[j].Name = mapped
+			}
+		}
+	}
+}
+
+func shouldPreserveStructuredHistoryTools(history []KiroHistoryMessage, currentToolResults []KiroToolResult, hasTools bool) bool {
+	if !hasTools {
+		return false
+	}
+	hasStructured := len(currentToolResults) > 0
+	allToolUseIDs := make(map[string]bool)
+	for _, h := range history {
+		if h.AssistantResponseMessage != nil {
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				if strings.TrimSpace(tu.ToolUseID) != "" {
+					hasStructured = true
+					allToolUseIDs[tu.ToolUseID] = true
+				}
+			}
+		}
+	}
+	if !hasStructured {
+		return false
+	}
+	for _, h := range history {
+		if h.UserInputMessage == nil || h.UserInputMessage.UserInputMessageContext == nil {
+			continue
+		}
+		for _, tr := range h.UserInputMessage.UserInputMessageContext.ToolResults {
+			if !allToolUseIDs[tr.ToolUseID] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validateStructuredToolHistory(history []KiroHistoryMessage, currentToolResults []KiroToolResult) ([]KiroToolResult, map[string]bool) {
+	allToolUseIDs := make(map[string]bool)
+	pairedToolUseIDs := make(map[string]bool)
+	for _, h := range history {
+		if h.AssistantResponseMessage != nil {
+			for _, tu := range h.AssistantResponseMessage.ToolUses {
+				if strings.TrimSpace(tu.ToolUseID) != "" {
+					allToolUseIDs[tu.ToolUseID] = true
+				}
+			}
+		}
+		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil {
+			for _, tr := range h.UserInputMessage.UserInputMessageContext.ToolResults {
+				if strings.TrimSpace(tr.ToolUseID) != "" {
+					pairedToolUseIDs[tr.ToolUseID] = true
+				}
+			}
+		}
+	}
+
+	filtered := currentToolResults[:0]
+	for _, tr := range currentToolResults {
+		if allToolUseIDs[tr.ToolUseID] && !pairedToolUseIDs[tr.ToolUseID] {
+			filtered = append(filtered, tr)
+			pairedToolUseIDs[tr.ToolUseID] = true
+		}
+	}
+
+	orphaned := make(map[string]bool)
+	for toolUseID := range allToolUseIDs {
+		if !pairedToolUseIDs[toolUseID] {
+			orphaned[toolUseID] = true
+		}
+	}
+	return filtered, orphaned
+}
+
+func removeOrphanedToolUses(history []KiroHistoryMessage, orphaned map[string]bool) {
+	if len(orphaned) == 0 {
+		return
+	}
+	for i := range history {
+		msg := history[i].AssistantResponseMessage
+		if msg == nil || len(msg.ToolUses) == 0 {
+			continue
+		}
+		filtered := msg.ToolUses[:0]
+		for _, toolUse := range msg.ToolUses {
+			if !orphaned[toolUse.ToolUseID] {
+				filtered = append(filtered, toolUse)
+			}
+		}
+		msg.ToolUses = filtered
+	}
+}
+
+func collectHistoryToolNames(history []KiroHistoryMessage) []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, h := range history {
+		if h.AssistantResponseMessage == nil {
+			continue
+		}
+		for _, tu := range h.AssistantResponseMessage.ToolUses {
+			name := strings.TrimSpace(tu.Name)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func appendMissingPlaceholderTools(tools []KiroToolWrapper, historyToolNames []string) []KiroToolWrapper {
+	if len(historyToolNames) == 0 {
+		return tools
+	}
+	seen := make(map[string]bool)
+	for _, tool := range tools {
+		seen[strings.ToLower(strings.TrimSpace(tool.ToolSpecification.Name))] = true
+	}
+	for _, name := range historyToolNames {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = name
+		w.ToolSpecification.Description = normalizeToolDesc("", name)
+		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(nil)}
+		tools = append(tools, w)
+	}
+	return tools
+}
+
 // ==================== Kiro -> Claude 转换 ====================
 
 func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
@@ -1397,15 +1582,32 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether current tool results form a valid active tool turn; if not,
-	// flatten them into the current message text (see ClaudeToKiro for rationale).
-	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+	kiroTools := convertOpenAITools(req.Tools)
 
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
+	keepCurrentToolResults := false
+	preserveHistoryTools := shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
+	if preserveHistoryTools {
+		validatedToolResults, orphanedToolUseIDs := validateStructuredToolHistory(history, currentToolResults)
+		if len(validatedToolResults) == len(currentToolResults) {
+			currentToolResults = validatedToolResults
+			removeOrphanedToolUses(history, orphanedToolUseIDs)
+			kiroTools = appendMissingPlaceholderTools(kiroTools, collectHistoryToolNames(history))
+			keepCurrentToolResults = len(currentToolResults) > 0
+			history = sanitizeKiroHistory(history, collectToolResultIDs(currentToolResults), true)
+		} else {
+			preserveHistoryTools = false
+		}
+	}
+	if !preserveHistoryTools {
+		// Decide whether current tool results form a valid active tool turn; if not,
+		// flatten them into the current message text (see ClaudeToKiro for rationale).
+		currentToolResultIDs := collectToolResultIDs(currentToolResults)
+		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+		if keepCurrentToolResults {
+			history = sanitizeKiroHistory(history, currentToolResultIDs, false)
+		} else {
+			history = sanitizeKiroHistory(history, nil, false)
+		}
 	}
 
 	// 构建最终内容
@@ -1426,9 +1628,6 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if len(currentToolResults) > 0 && !keepCurrentToolResults && currentContent != "" {
 		finalContent = joinHistoryText(currentContent, buildToolResultsContinuation(currentToolResults))
 	}
-
-	// 转换工具
-	kiroTools := convertOpenAITools(req.Tools)
 
 	// 构建 payload
 	payload := &KiroPayload{}
@@ -1683,7 +1882,7 @@ func joinHistoryText(existing, narrated string) string {
 // currentToolResultIDs is the set of toolUseId values carried by the current
 // (outgoing) message. When the last history entry is an assistant message whose
 // tool uses are fully covered by that set, its structured toolUses are kept.
-func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool, preserveStructuredTools bool) []KiroHistoryMessage {
 	if len(history) == 0 {
 		return history
 	}
@@ -1705,7 +1904,7 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	// Determine whether the last history assistant turn is the "active" tool turn
 	// answered by the current message. If so, its structured toolUses stay.
 	activeIdx := -1
-	if len(currentToolResultIDs) > 0 {
+	if !preserveStructuredTools && len(currentToolResultIDs) > 0 {
 		last := history[len(history)-1]
 		if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
 			allCovered := true
@@ -1733,7 +1932,7 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			}
 		}
 
-		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 {
+		if !preserveStructuredTools && msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 {
 			if i == activeIdx {
 				continue // keep the active tool turn structured
 			}
@@ -1748,7 +1947,7 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
 			ctx := msg.UserInputMessage.UserInputMessageContext
-			if len(ctx.ToolResults) > 0 {
+			if !preserveStructuredTools && len(ctx.ToolResults) > 0 {
 				narrated := narrateToolResults(ctx.ToolResults, toolNames)
 				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
 				ctx.ToolResults = nil
@@ -1769,7 +1968,13 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			strings.TrimSpace(msg.UserInputMessage.Content) == "" &&
 			len(msg.UserInputMessage.Images) == 0 &&
 			len(msg.UserInputMessage.Documents) == 0 {
-			msg.UserInputMessage.Content = minimalFallbackUserContent
+			if preserveStructuredTools &&
+				msg.UserInputMessage.UserInputMessageContext != nil &&
+				len(msg.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+				msg.UserInputMessage.Content = "Tool results provided."
+			} else {
+				msg.UserInputMessage.Content = minimalFallbackUserContent
+			}
 		}
 	}
 
@@ -1796,6 +2001,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		if msg.UserInputMessage != nil && len(cleaned) > 0 {
 			last := cleaned[len(cleaned)-1]
 			if last.UserInputMessage != nil &&
+				(last.UserInputMessage.UserInputMessageContext == nil || len(last.UserInputMessage.UserInputMessageContext.ToolResults) == 0) &&
+				(msg.UserInputMessage.UserInputMessageContext == nil || len(msg.UserInputMessage.UserInputMessageContext.ToolResults) == 0) &&
 				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
 				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
 				len(msg.UserInputMessage.Images) == 0 &&
