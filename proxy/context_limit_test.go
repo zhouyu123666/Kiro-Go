@@ -11,6 +11,9 @@ import (
 	"testing"
 
 	"kiro-go/config"
+
+	tiktoken "github.com/pkoukk/tiktoken-go"
+	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
 )
 
 func TestMain(m *testing.M) {
@@ -24,8 +27,30 @@ func oversizedInputText() string {
 	return strings.Repeat("context ", maxKiroInputTokens+1)
 }
 
-func clientCompactionInputText() string {
-	return strings.Repeat("context ", 185_000)
+func testGatewayTokenCount(t *testing.T, text string) int {
+	t.Helper()
+	tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
+	encoder, err := tiktoken.GetEncoding("cl100k_base")
+	if err != nil {
+		t.Fatalf("get cl100k_base encoding: %v", err)
+	}
+	return len(encoder.EncodeOrdinary(text))
+}
+
+func TestClaudeCompactionEstimateUsesKiroGatewayTokenizer(t *testing.T) {
+	content := strings.Repeat("context ", 1_000)
+	req := &ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: content},
+		},
+	}
+
+	gatewayBaseTokens := 4 + testGatewayTokenCount(t, "user") + testGatewayTokenCount(t, content) + 3
+	want := int(float64(gatewayBaseTokens) * claudeTokenCorrectionFactor)
+	if got := estimateClaudeCompactionInputTokens(req); got != want {
+		t.Fatalf("compaction estimate=%d, want kiro-gateway estimate %d", got, want)
+	}
 }
 
 func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
@@ -70,12 +95,13 @@ func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
 
 func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	content := oversizedInputText()
-	body, err := json.Marshal(ClaudeRequest{
+	claudeReq := ClaudeRequest{
 		Model: "claude-opus-4.7",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: content},
 		},
-	})
+	}
+	body, err := json.Marshal(claudeReq)
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
@@ -86,25 +112,28 @@ func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rr, req)
 
-	assertPromptTooLongError(t, rr, estimateApproxTokens(content))
+	assertPromptTooLongError(t, rr, estimateClaudeCompactionInputTokens(&claudeReq))
 }
 
-func TestClaudeMessagesOverClientCompactionLimitReturnsPromptTooLong(t *testing.T) {
-	content := clientCompactionInputText()
-	estimated := estimateApproxTokens(content)
-	if estimated <= clientKiroInputTokens {
-		t.Fatalf("test input should exceed client compaction limit %d, estimated %d", clientKiroInputTokens, estimated)
-	}
-	if exceedsKiroInputTokenLimit(estimated) {
-		t.Fatalf("test input should stay below hard safety limit, estimated %d", estimated)
-	}
-
-	body, err := json.Marshal(ClaudeRequest{
-		Model: "claude-opus-4.7",
+func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing.T) {
+	repeatCount := clientKiroInputTokens*100/115 + 1_000
+	content := strings.Repeat("context ", repeatCount)
+	claudeReq := ClaudeRequest{
+		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: content},
 		},
-	})
+	}
+	gatewayEstimated := estimateClaudeCompactionInputTokens(&claudeReq)
+	if gatewayEstimated <= clientKiroInputTokens {
+		t.Fatalf("test setup expected gateway estimate above %d, got %d",
+			clientKiroInputTokens, gatewayEstimated)
+	}
+	if exceedsKiroInputTokenLimit(gatewayEstimated) {
+		t.Fatalf("test setup expected gateway estimate below hard safety limit, got %d", gatewayEstimated)
+	}
+
+	body, err := json.Marshal(claudeReq)
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
@@ -115,7 +144,38 @@ func TestClaudeMessagesOverClientCompactionLimitReturnsPromptTooLong(t *testing.
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rr, req)
 
-	assertPromptTooLongError(t, rr, estimated)
+	assertPromptTooLongError(t, rr, gatewayEstimated)
+}
+
+func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
+	claudeReq := ClaudeRequest{
+		Model: "claude-opus-4.8",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: strings.Repeat("context ", 1_000)},
+		},
+	}
+	body, err := json.Marshal(claudeReq)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(string(body)))
+
+	h := &Handler{}
+	h.handleCountTokens(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got map[string]int
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := estimateClaudeCompactionInputTokens(&claudeReq)
+	if got["input_tokens"] != want {
+		t.Fatalf("count_tokens input_tokens=%d, want gateway estimate %d", got["input_tokens"], want)
+	}
 }
 
 func TestOpenAIChatRejectsOverKiroInputTokenLimit(t *testing.T) {
@@ -169,12 +229,12 @@ func TestBuildModelInfoAdvertisesClientCompactionLimit(t *testing.T) {
 	}
 }
 
-func TestClientCompactionLimitLeavesHeadroomBeforeHardLimit(t *testing.T) {
-	if clientKiroInputTokens >= maxKiroInputTokens {
-		t.Fatalf("client limit %d must stay below hard limit %d", clientKiroInputTokens, maxKiroInputTokens)
+func TestClientCompactionLimitStaysWithinAdvertisedHardLimit(t *testing.T) {
+	if clientKiroInputTokens > maxKiroInputTokens {
+		t.Fatalf("client limit %d must not exceed hard limit %d", clientKiroInputTokens, maxKiroInputTokens)
 	}
 	if exceedsKiroInputTokenLimit(clientKiroInputTokens + 1) {
-		t.Fatalf("client compaction headroom must not be treated as a hard reject")
+		t.Fatalf("client compaction threshold must not be treated as a hard reject")
 	}
 }
 
@@ -342,11 +402,15 @@ func assertPromptTooLongError(t *testing.T, rr *httptest.ResponseRecorder, estim
 	body := parsed.Error.Message
 	for _, want := range []string{
 		"Prompt is too long",
-		"tokens > 180000 maximum",
+		"tokens",
+		"tokens > " + strconv.Itoa(clientKiroInputTokens),
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected response to contain %q, got %s", want, body)
 		}
+	}
+	if strings.Contains(body, "maximum") {
+		t.Fatalf("expected response to omit maximum token text, got %s", body)
 	}
 	if !strings.Contains(body, strconv.Itoa(estimatedInputTokens)) {
 		t.Fatalf("expected response to contain estimated token count %d, got %s", estimatedInputTokens, body)

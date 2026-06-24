@@ -787,7 +787,11 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
-	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	estimatedTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	if !ok {
+		logger.Warnf("[ClaudeContextGate] kiro-gateway count_tokens estimate unavailable; falling back to approximate token estimator")
+		estimatedTokens = estimateClaudeRequestInputTokens(effectiveReq)
+	}
 	if estimatedTokens < 1 {
 		estimatedTokens = 1
 	}
@@ -825,14 +829,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	clientModel := rawReq.Model
-	rawEstimatedInputTokens := estimateClaudeCompactionInputTokens(&rawReq)
-	rawExceedsClientLimit := exceedsClientCompactionLimit(rawEstimatedInputTokens)
-	logger.Debugf("[ClaudeContextGate] stage=raw model=%s stream=%t estimatedInputTokens=%d clientLimit=%d exceedsClientLimit=%t",
-		clientModel, rawReq.Stream, rawEstimatedInputTokens, clientKiroInputTokens, rawExceedsClientLimit)
+	gatewayEstimatedInputTokens := estimateClaudeCompactionInputTokens(&rawReq)
+	rawExceedsClientLimit := exceedsClientCompactionLimit(gatewayEstimatedInputTokens)
+	logger.Debugf("[ClaudeContextGate] stage=raw model=%s stream=%t gatewayInputTokens=%d clientLimit=%d exceedsClientLimit=%t",
+		clientModel, rawReq.Stream, gatewayEstimatedInputTokens, clientKiroInputTokens, rawExceedsClientLimit)
 	if rawExceedsClientLimit {
-		msg := promptTooLongErrorMessage(rawEstimatedInputTokens)
-		logger.Warnf("[ClaudeContextGate] rejecting prompt-too-long stage=raw model=%s estimatedInputTokens=%d clientLimit=%d message=%q",
-			clientModel, rawEstimatedInputTokens, clientKiroInputTokens, msg)
+		msg := promptTooLongErrorMessage(gatewayEstimatedInputTokens)
+		logger.Warnf("[ClaudeContextGate] rejecting prompt-too-long stage=raw model=%s gatewayInputTokens=%d clientLimit=%d message=%q",
+			clientModel, gatewayEstimatedInputTokens, clientKiroInputTokens, msg)
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 		return
 	}

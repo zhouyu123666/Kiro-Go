@@ -3,10 +3,11 @@ package proxy
 import (
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 )
 
 const maxKiroInputTokens = 200_000
-const clientKiroInputTokens = 180_000
+const clientKiroInputTokens = 190_000
 const maxKiroEstimatedInputTokens = int(maxKiroInputTokens * claudeTokenCorrectionFactor)
 
 const contextLimitMessage = "Model context limit reached. Conversation size exceeds model capacity."
@@ -28,6 +29,10 @@ func estimateClaudeCompactionInputTokens(req *ClaudeRequest) int {
 	cloned := *req
 	cloned.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&cloned, thinking)
+	if tokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq); ok {
+		return tokens
+	}
+	logger.Warnf("[ClaudeContextGate] kiro-gateway token estimate unavailable; falling back to approximate token estimator")
 	return estimateClaudeRequestInputTokens(effectiveReq)
 }
 
@@ -43,5 +48,5 @@ func promptTooLongErrorMessage(estimatedInputTokens int) string {
 	if estimatedInputTokens <= 0 {
 		estimatedInputTokens = clientKiroInputTokens + 1
 	}
-	return fmt.Sprintf("Prompt is too long: %d tokens > %d maximum", estimatedInputTokens, clientKiroInputTokens)
+	return fmt.Sprintf("Prompt is too long: %d tokens > %d", estimatedInputTokens, clientKiroInputTokens)
 }
