@@ -883,18 +883,23 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
+	// 报告用的输入 token 上限：仅本轮最后一条 user 消息的 token 数。
+	// 用于把展示/计费的输入 token 压到“用户实际输入”，避免一句 hi 被
+	// 计成系统提示词+工具定义的完整估算值。
+	userInputTokens := estimateClaudeLastUserInputTokens(&req)
+
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, userInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, userInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, userInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -910,7 +915,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := estimatedInputTokens
+	startInputTokens := capInputTokens(userInputTokens, estimatedInputTokens)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -1301,6 +1306,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1491,7 +1497,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, userInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1563,6 +1569,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1663,15 +1670,16 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
+	userInputTokens := estimateOpenAILastUserInputTokens(&req)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, userInputTokens, apiKeyID, usageReportWindow)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, userInputTokens, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, userInputTokens int, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2018,6 +2026,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2062,7 +2071,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, userInputTokens int, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2123,6 +2132,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
