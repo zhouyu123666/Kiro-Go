@@ -188,13 +188,21 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		}
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -537,13 +545,21 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		}
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

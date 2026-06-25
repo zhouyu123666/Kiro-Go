@@ -916,6 +916,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := capInputTokens(userInputTokens, estimatedInputTokens)
+	startInputTokens = capInputTokensToContextWindow(startInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -1300,13 +1301,23 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		// 输出 token 优先用 kiro 在 OnComplete 里返回的真值；只有当 kiro
+		// 没给(流未带 usage 帧等情况，outputTokens 仍为 0)时才本地估算兜底。
+		if outputTokens <= 0 {
+			outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		}
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1563,13 +1574,21 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		}
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2016,17 +2035,25 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			reasoningOutput = ""
 		}
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
-		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+		if outputTokens <= 0 {
+			outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+			for _, tc := range toolCalls {
+				outputTokens += estimateApproxTokens(tc.Function.Name)
+				outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			}
 		}
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2126,13 +2153,21 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			reasoningContent = ""
 		}
 
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		}
+		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
+		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
+		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
+		if inputTokens <= 0 {
+			if contextUsagePercentage > 0 {
+				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+			} else {
+				inputTokens = estimatedInputTokens
+			}
 		}
 		inputTokens = capInputTokens(userInputTokens, inputTokens)
+		inputTokens = capInputTokensToContextWindow(inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
