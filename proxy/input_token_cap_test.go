@@ -24,6 +24,32 @@ func TestCapInputTokens(t *testing.T) {
 	}
 }
 
+func TestCapInputTokensToContextWindow(t *testing.T) {
+	cases := []struct {
+		name       string
+		inputToken int
+		model      string
+		want       int
+	}{
+		// 200k 模型：压缩触发线 = 200000 * 0.95 = 190000
+		{"200k model under limit unchanged", 150000, "claude-sonnet-4.5", 150000},
+		{"200k model over limit clamped to 190k", 210000, "claude-sonnet-4.5", 190000},
+		{"200k model exactly at limit", 190000, "claude-sonnet-4.5", 190000},
+		// 1M 模型：压缩触发线 = 1000000 * 0.95 = 950000，验证不会超过 100 万
+		{"1M model 1.05M clamped to 950k", 1050000, "claude-opus-4.8", 950000},
+		{"1M model under limit unchanged", 800000, "claude-opus-4.8", 800000},
+		// 未知模型回退 maxKiroInputTokens(200k)，触发线 190k
+		{"unknown model falls back to 190k", 250000, "some-unknown-model", 190000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capInputTokensToContextWindow(tc.inputToken, tc.model); got != tc.want {
+				t.Fatalf("capInputTokensToContextWindow(%d, %q) = %d, want %d", tc.inputToken, tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEstimateClaudeLastUserInputTokens(t *testing.T) {
 	req := &ClaudeRequest{
 		System: "you are a very long system prompt with lots of instructions",

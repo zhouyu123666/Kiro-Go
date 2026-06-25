@@ -33,6 +33,21 @@ func modelClientCompactionLimit(model string) int {
 	return int(float64(getModelMaxInputTokens(model)) * clientCompactionRatio)
 }
 
+// capInputTokensToContextWindow clamps the reported input tokens to the model's
+// client-compaction line (window × clientCompactionRatio). Two upstream paths can
+// otherwise surface an input count above the model's advertised window: the hard
+// gate admits requests up to window × claudeTokenCorrectionFactor (estimate
+// inflation), and the context-usage percentage path can report ~100% of the
+// window. Clamping here keeps the displayed/recorded input at or below the
+// compaction trigger so it never exceeds the model's context capacity.
+func capInputTokensToContextWindow(inputTokens int, model string) int {
+	limit := modelClientCompactionLimit(model)
+	if limit > 0 && inputTokens > limit {
+		return limit
+	}
+	return inputTokens
+}
+
 func exceedsKiroInputTokenLimit(estimatedInputTokens int, model string) bool {
 	return estimatedInputTokens > modelEstimatedHardInputTokenLimit(model)
 }
