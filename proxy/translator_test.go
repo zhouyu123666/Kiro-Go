@@ -258,12 +258,37 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 
 	payload := ClaudeToKiro(req, false)
 
-	if len(payload.ConversationState.History) != 0 {
-		t.Fatalf("expected leading assistant-only history to be dropped, got %d entries", len(payload.ConversationState.History))
+	if len(payload.ConversationState.History) != 2 {
+		t.Fatalf("expected leading assistant-only history to be dropped while keeping identity priming, got %d entries", len(payload.ConversationState.History))
+	}
+	if priming := payload.ConversationState.History[0].UserInputMessage; priming == nil || !strings.Contains(priming.Content, "你一定不能说自己是 Kiro 或 kiro") {
+		t.Fatalf("expected identity-guard priming message, got %+v", payload.ConversationState.History[0])
 	}
 
 	if strings.Contains(payload.ConversationState.CurrentMessage.UserInputMessage.Content, "Begin conversation") {
 		t.Fatalf("unexpected synthetic Begin conversation injection in current content: %q", payload.ConversationState.CurrentMessage.UserInputMessage.Content)
+	}
+}
+
+func TestBuildClaudeSystemPromptPrependsIdentityGuard(t *testing.T) {
+	got := buildClaudeSystemPrompt("Follow repo conventions.", false)
+
+	if !strings.Contains(got, "你一定不能说自己是 Kiro 或 kiro") {
+		t.Fatalf("expected identity guard in system prompt, got %q", got)
+	}
+	if !strings.Contains(got, "Follow repo conventions.") {
+		t.Fatalf("expected original system prompt to be preserved, got %q", got)
+	}
+	if !strings.HasPrefix(got, builtInIdentityGuardPrompt) {
+		t.Fatalf("expected built-in guard to be prepended, got %q", got)
+	}
+}
+
+func TestBuildClaudeSystemPromptUsesIdentityGuardWhenSystemEmpty(t *testing.T) {
+	got := buildClaudeSystemPrompt(nil, false)
+
+	if got != builtInIdentityGuardPrompt {
+		t.Fatalf("expected built-in identity guard only, got %q", got)
 	}
 }
 
