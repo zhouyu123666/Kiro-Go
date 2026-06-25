@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"unicode"
 )
 
@@ -318,4 +319,51 @@ func estimateOpenAIContentTokens(content interface{}) int {
 
 func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []KiroToolUse) int {
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
+}
+
+// estimateClaudeLastUserInputTokens returns the estimated token count of the
+// last user-role message in the request. This is the "what the user actually
+// typed this turn" figure used to cap the displayed/recorded input tokens so a
+// short prompt is not reported as the full gateway estimate (system prompt +
+// tool definitions + history). Returns 0 when no user message is present.
+func estimateClaudeLastUserInputTokens(req *ClaudeRequest) int {
+	if req == nil {
+		return 0
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if strings.TrimSpace(req.Messages[i].Role) != "user" {
+			continue
+		}
+		return estimateClaudeValueTokens(req.Messages[i].Content)
+	}
+	return 0
+}
+
+// estimateOpenAILastUserInputTokens is the OpenAI-shaped counterpart of
+// estimateClaudeLastUserInputTokens.
+func estimateOpenAILastUserInputTokens(req *OpenAIRequest) int {
+	if req == nil {
+		return 0
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if strings.TrimSpace(req.Messages[i].Role) != "user" {
+			continue
+		}
+		return estimateOpenAIContentTokens(req.Messages[i].Content)
+	}
+	return 0
+}
+
+// capInputTokens applies the reporting rule: when the user's own input is no
+// larger than the gateway-computed input tokens, report the user's input;
+// otherwise report the computed value. A non-positive userInputTokens (no user
+// message found) leaves the computed value untouched so display is never zeroed.
+func capInputTokens(userInputTokens, computedInputTokens int) int {
+	if userInputTokens <= 0 {
+		return computedInputTokens
+	}
+	if userInputTokens <= computedInputTokens {
+		return userInputTokens
+	}
+	return computedInputTokens
 }

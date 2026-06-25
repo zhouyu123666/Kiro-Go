@@ -119,20 +119,21 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
 	usageReportWindow := getClaudeCodeUsageReportWindow(actualModel)
+	userInputTokens := estimateOpenAILastUserInputTokens(openaiReq)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, userInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, userInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, userInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -193,6 +194,7 @@ func (h *Handler) handleResponsesNonStream(
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -281,7 +283,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, userInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -541,6 +543,7 @@ func (h *Handler) handleResponsesStream(
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
+		inputTokens = capInputTokens(userInputTokens, inputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
