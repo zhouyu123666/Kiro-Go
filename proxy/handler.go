@@ -554,7 +554,7 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 		"id":               id,
 		"object":           "model",
 		"owned_by":         ownedBy,
-		"tokenLimits":      map[string]int{"maxInputTokens": clientKiroInputTokens},
+		"tokenLimits":      map[string]int{"maxInputTokens": modelClientCompactionLimit(id)},
 		"supports_image":   supportsImage,
 		"input_modalities": modalities,
 		"modalities":       modalitiesMap,
@@ -830,13 +830,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	clientModel := rawReq.Model
 	gatewayEstimatedInputTokens := estimateClaudeCompactionInputTokens(&rawReq)
-	rawExceedsClientLimit := exceedsClientCompactionLimit(gatewayEstimatedInputTokens)
+	clientCompactionLimit := modelClientCompactionLimit(clientModel)
+	rawExceedsClientLimit := exceedsClientCompactionLimit(gatewayEstimatedInputTokens, clientModel)
 	logger.Debugf("[ClaudeContextGate] stage=raw model=%s stream=%t gatewayInputTokens=%d clientLimit=%d exceedsClientLimit=%t",
-		clientModel, rawReq.Stream, gatewayEstimatedInputTokens, clientKiroInputTokens, rawExceedsClientLimit)
+		clientModel, rawReq.Stream, gatewayEstimatedInputTokens, clientCompactionLimit, rawExceedsClientLimit)
 	if rawExceedsClientLimit {
-		msg := promptTooLongErrorMessage(gatewayEstimatedInputTokens)
+		msg := promptTooLongErrorMessage(gatewayEstimatedInputTokens, clientModel)
 		logger.Warnf("[ClaudeContextGate] rejecting prompt-too-long stage=raw model=%s gatewayInputTokens=%d clientLimit=%d message=%q",
-			clientModel, gatewayEstimatedInputTokens, clientKiroInputTokens, msg)
+			clientModel, gatewayEstimatedInputTokens, clientCompactionLimit, msg)
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 		return
 	}
@@ -873,18 +874,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		currentTools = len(current.UserInputMessageContext.Tools)
 		currentToolResults = len(current.UserInputMessageContext.ToolResults)
 	}
-	exceedsHardLimit := exceedsKiroInputTokenLimit(estimatedInputTokens)
+	exceedsHardLimit := exceedsKiroInputTokenLimit(estimatedInputTokens, req.Model)
 	logger.Debugf("[ClaudeContextGate] stage=kiroPayload model=%s actualModel=%s stream=%t estimatedInputTokens=%d hardLimit=%d exceedsHardLimit=%t history=%d currentContentChars=%d currentTools=%d currentToolResults=%d",
-		clientModel, req.Model, req.Stream, estimatedInputTokens, maxKiroInputTokens, exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
+		clientModel, req.Model, req.Stream, estimatedInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
 	if exceedsHardLimit {
-		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens, req.Model))
 		return
 	}
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	usageReportWindow := getClaudeCodeUsageReportWindow(clientModel)
+	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
@@ -951,7 +952,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
+		var contextUsagePercentage float64
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1260,7 +1261,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -1286,11 +1287,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1300,6 +1296,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			thinkingOutput = ""
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		if contextUsagePercentage > 0 {
+			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		} else if inputTokens <= 0 {
+			inputTokens = estimatedInputTokens
+		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1513,7 +1514,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
+		var contextUsagePercentage float64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1534,7 +1535,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -1556,12 +1557,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
+		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		if contextUsagePercentage > 0 {
+			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1647,8 +1648,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientModel := req.Model
-
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
@@ -1657,13 +1656,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
-	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
-		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
+	if exceedsKiroInputTokenLimit(estimatedInputTokens, req.Model) {
+		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens, req.Model))
 		return
 	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	usageReportWindow := getClaudeCodeUsageReportWindow(clientModel)
+	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
 		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
 	} else {
@@ -1707,7 +1706,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var toolCallIndex int
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
+		var contextUsagePercentage float64
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -1980,7 +1979,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -2001,11 +2000,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -2018,6 +2012,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		for _, tc := range toolCalls {
 			outputTokens += estimateApproxTokens(tc.Function.Name)
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+		}
+		if contextUsagePercentage > 0 {
+			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		} else if inputTokens <= 0 {
+			inputTokens = estimatedInputTokens
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -2085,7 +2084,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
+		var contextUsagePercentage float64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2099,7 +2098,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -2118,12 +2117,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
+		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		if contextUsagePercentage > 0 {
+			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

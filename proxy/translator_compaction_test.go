@@ -57,7 +57,9 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		t.Fatalf("expected current content to be the compaction instruction, got %q", cur.Content)
 	}
 
-	// The narrated tool activity should survive somewhere in history as text.
+	// The narrated tool activity should survive somewhere in the outgoing context
+	// as text. Adjacent user turns are merged before conversion, so the final
+	// completed tool result may live in currentMessage beside the plain instruction.
 	var historyText strings.Builder
 	for _, h := range payload.ConversationState.History {
 		if h.AssistantResponseMessage != nil {
@@ -69,6 +71,7 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 			historyText.WriteString("\n")
 		}
 	}
+	historyText.WriteString(cur.Content)
 	combined := historyText.String()
 	if !strings.Contains(combined, "exec_command") {
 		t.Fatalf("expected narrated tool calls to mention exec_command, got:\n%s", combined)

@@ -6,7 +6,7 @@ import (
 	"unicode"
 )
 
-const claudeTokenCorrectionFactor = 1.15
+const claudeTokenCorrectionFactor = 1.05
 
 // Binary media (images, documents) is sent to the model as attachments, not as
 // the raw base64 string in the request body. Estimating these blocks by JSON-
