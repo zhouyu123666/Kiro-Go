@@ -137,8 +137,9 @@ func TestClaudeCompactionGateUsesRawRequestBeforeRTKCompression(t *testing.T) {
 		t.Fatalf("decode raw request: %v", err)
 	}
 	rawEstimate := estimateClaudeCompactionInputTokens(&rawReq)
-	if rawEstimate <= clientKiroInputTokens {
-		t.Fatalf("test setup expected raw request estimate to exceed %d, got %d", clientKiroInputTokens, rawEstimate)
+	compactionLimit := modelClientCompactionLimit("claude-sonnet-4.5")
+	if rawEstimate <= compactionLimit {
+		t.Fatalf("test setup expected raw request estimate to exceed %d, got %d", compactionLimit, rawEstimate)
 	}
 
 	compressed := maybeCompressRequestBody([]byte(requestBody))
@@ -148,8 +149,8 @@ func TestClaudeCompactionGateUsesRawRequestBeforeRTKCompression(t *testing.T) {
 	}
 	compressedPayload := ClaudeToKiro(&compressedReq, false)
 	compressedEstimate := estimateKiroPayloadInputTokens(compressedPayload)
-	if compressedEstimate >= clientKiroInputTokens {
-		t.Fatalf("test setup expected compressed Kiro payload estimate below %d, got %d", clientKiroInputTokens, compressedEstimate)
+	if compressedEstimate >= compactionLimit {
+		t.Fatalf("test setup expected compressed Kiro payload estimate below %d, got %d", compactionLimit, compressedEstimate)
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
@@ -157,7 +158,7 @@ func TestClaudeCompactionGateUsesRawRequestBeforeRTKCompression(t *testing.T) {
 	h := &Handler{}
 	h.handleClaudeMessages(rec, req)
 
-	assertPromptTooLongError(t, rec, rawEstimate)
+	assertPromptTooLongError(t, rec, rawEstimate, "claude-sonnet-4.5")
 }
 
 func TestRTKCompressesMultiTurnOpenAIChatSessionBeforeUpstreamKiroRequest(t *testing.T) {

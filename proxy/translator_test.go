@@ -53,45 +53,26 @@ func TestOpenAIToKiroPreservesStructuredAssistantAndToolContent(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
-	// History starts with a priming pair.
-	if len(payload.ConversationState.History) != 4 {
-		t.Fatalf("expected 4 history items (2 priming + 2 conversation), got %d", len(payload.ConversationState.History))
+	if len(payload.ConversationState.History) != 2 {
+		t.Fatalf("expected 2 history items (system+first user, assistant), got %d", len(payload.ConversationState.History))
 	}
 
-	// history[0]: priming user
-	primingUser := payload.ConversationState.History[0].UserInputMessage
-	if primingUser == nil {
-		t.Fatalf("expected history[0] to be priming user message")
-	}
-	if !strings.Contains(primingUser.Content, "system-a") || !strings.Contains(primingUser.Content, "system-b") {
-		t.Fatalf("expected priming user message to contain system prompt, got %q", primingUser.Content)
-	}
-	if strings.Contains(primingUser.Content, "first-question") {
-		t.Fatalf("expected system prompt priming not to contain user question, got %q", primingUser.Content)
-	}
-
-	// history[1]: priming assistant
-	primingAssistant := payload.ConversationState.History[1].AssistantResponseMessage
-	if primingAssistant == nil {
-		t.Fatalf("expected history[1] to be priming assistant message")
-	}
-	if primingAssistant.Content != "I will follow these instructions." {
-		t.Fatalf("expected priming assistant ack, got %q", primingAssistant.Content)
-	}
-
-	// history[2]: first user turn
-	firstConvUser := payload.ConversationState.History[2].UserInputMessage
+	// history[0]: system prompt prepended to first user turn.
+	firstConvUser := payload.ConversationState.History[0].UserInputMessage
 	if firstConvUser == nil {
-		t.Fatalf("expected history[2] to be first conversation user message")
+		t.Fatalf("expected history[0] to be first user message")
+	}
+	if !strings.Contains(firstConvUser.Content, "system-a") || !strings.Contains(firstConvUser.Content, "system-b") {
+		t.Fatalf("expected first user message to contain system prompt, got %q", firstConvUser.Content)
 	}
 	if !strings.Contains(firstConvUser.Content, "first-question") {
-		t.Fatalf("expected history[2] to contain first-question, got %q", firstConvUser.Content)
+		t.Fatalf("expected history[0] to contain first-question, got %q", firstConvUser.Content)
 	}
 
-	// history[3]: assistant reply
-	historyAssistant := payload.ConversationState.History[3].AssistantResponseMessage
+	// history[1]: assistant reply
+	historyAssistant := payload.ConversationState.History[1].AssistantResponseMessage
 	if historyAssistant == nil {
-		t.Fatalf("expected history[3] to be assistant message")
+		t.Fatalf("expected history[1] to be assistant message")
 	}
 	if historyAssistant.Content != "assistant-structured" {
 		t.Fatalf("expected assistant structured content to be preserved, got %q", historyAssistant.Content)
@@ -177,6 +158,170 @@ func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
 		if strings.TrimSpace(a.Content) == "." || strings.TrimSpace(a.Content) == "" {
 			t.Fatalf("history[%d] is a hollow assistant turn that should have been dropped", i)
 		}
+	}
+}
+
+func TestClaudeToKiroSingleTurnSystemPrependedToCurrent(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: "Follow repo conventions.",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	if len(payload.ConversationState.History) != 0 {
+		t.Fatalf("single-turn request should not create priming history, got %d entries", len(payload.ConversationState.History))
+	}
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(cur, "Follow repo conventions.") || !strings.Contains(cur, "hello") {
+		t.Fatalf("expected system prompt and user content in current message, got %q", cur)
+	}
+}
+
+func TestOpenAIToKiroLastAssistantBecomesContinueCurrent(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "u1"},
+			{Role: "assistant", Content: "a1"},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != kiroContinueContent {
+		t.Fatalf("expected Continue current message after final assistant, got %q", got)
+	}
+	history := payload.ConversationState.History
+	if len(history) != 2 || history[1].AssistantResponseMessage == nil || history[1].AssistantResponseMessage.Content != "a1" {
+		t.Fatalf("expected final assistant moved to history, got %+v", history)
+	}
+}
+
+func TestOpenAIToKiroAddsContinueAssistantWhenHistoryEndsUser(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "find weather"},
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ID:   "call_1",
+					Type: "function",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: "get_weather", Arguments: "{}"},
+				}},
+			},
+			{Role: "user", Content: "continue"},
+		},
+	}
+
+	payload := OpenAIToKiro(req, false)
+	history := payload.ConversationState.History
+	if len(history) == 0 {
+		t.Fatalf("expected non-empty history")
+	}
+	last := history[len(history)-1].AssistantResponseMessage
+	if last == nil || last.Content != kiroContinueContent {
+		t.Fatalf("expected synthetic Continue assistant at history tail, got %+v", history[len(history)-1])
+	}
+}
+
+func TestClaudeToKiroRestoresThinkingBlockIntoAssistantHistory(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "u1"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "thinking", "thinking": "private chain"},
+				map[string]interface{}{"type": "text", "text": "visible answer"},
+			}},
+			{Role: "user", Content: "u2"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	var assistantContent string
+	for _, h := range payload.ConversationState.History {
+		if h.AssistantResponseMessage != nil {
+			assistantContent = h.AssistantResponseMessage.Content
+		}
+	}
+	if !strings.Contains(assistantContent, "<thinking>private chain</thinking>") ||
+		!strings.Contains(assistantContent, "visible answer") {
+		t.Fatalf("expected thinking text restored into assistant history, got %q", assistantContent)
+	}
+}
+
+func TestClaudeToKiroDedupesCurrentToolResultsByID(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Tools: []ClaudeTool{{
+			Name:        "read_file",
+			Description: "read",
+			InputSchema: map[string]interface{}{"type": "object"},
+		}},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "read"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "tool_1", "name": "read_file", "input": map[string]interface{}{"path": "a.txt"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_1", "content": "first"},
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "tool_1", "content": "duplicate"},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.ToolResults) != 1 {
+		t.Fatalf("expected duplicate toolUseId to be removed, got %#v", ctx)
+	}
+	if got := ctx.ToolResults[0].Content[0].Text; got != "first" {
+		t.Fatalf("expected first tool result to survive, got %q", got)
+	}
+}
+
+func TestOpenAIToKiroSlimsOldHistoryImages(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+	messages := make([]OpenAIMessage, 0)
+	for i := 0; i < 7; i++ {
+		messages = append(messages,
+			OpenAIMessage{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{"type": "text", "text": "image turn"},
+					map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": dataURL}},
+				},
+			},
+			OpenAIMessage{Role: "assistant", Content: "ok"},
+		)
+	}
+	messages = append(messages, OpenAIMessage{Role: "user", Content: "final"})
+
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-sonnet-4.5", Messages: messages}, false)
+
+	var oldUser, recentUser *KiroUserInputMessage
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage == nil {
+			continue
+		}
+		if oldUser == nil {
+			oldUser = h.UserInputMessage
+		}
+		recentUser = h.UserInputMessage
+	}
+	if oldUser == nil || len(oldUser.Images) != 0 || !strings.Contains(oldUser.Content, "已在历史记录中省略") {
+		t.Fatalf("expected old history image to be replaced with placeholder, got %+v", oldUser)
+	}
+	if recentUser == nil || len(recentUser.Images) != 1 {
+		t.Fatalf("expected recent history image to be preserved, got %+v", recentUser)
 	}
 }
 
@@ -529,7 +674,7 @@ func TestClaudePDFSourceIsNotForwardedAsImage(t *testing.T) {
 	if cur.Documents[0].Format != "pdf" || cur.Documents[0].Source.Bytes != pdfData {
 		t.Fatalf("unexpected PDF document payload: %+v", cur.Documents[0])
 	}
-	if cur.Content != "summarize this" {
+	if !strings.Contains(cur.Content, "summarize this") {
 		t.Fatalf("expected text content preserved, got %q", cur.Content)
 	}
 }

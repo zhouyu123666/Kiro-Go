@@ -96,7 +96,7 @@ func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
 func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	content := oversizedInputText()
 	claudeReq := ClaudeRequest{
-		Model: "claude-opus-4.7",
+		Model: "claude-sonnet-4.5",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: content},
 		},
@@ -112,24 +112,26 @@ func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rr, req)
 
-	assertPromptTooLongError(t, rr, estimateClaudeCompactionInputTokens(&claudeReq))
+	assertPromptTooLongError(t, rr, estimateClaudeCompactionInputTokens(&claudeReq), "claude-sonnet-4.5")
 }
 
 func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing.T) {
-	repeatCount := clientKiroInputTokens*100/115 + 1_000
+	const model = "claude-sonnet-4.5"
+	compactionLimit := modelClientCompactionLimit(model)
+	repeatCount := compactionLimit*100/115 + 1_000
 	content := strings.Repeat("context ", repeatCount)
 	claudeReq := ClaudeRequest{
-		Model: "claude-opus-4.8",
+		Model: model,
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: content},
 		},
 	}
 	gatewayEstimated := estimateClaudeCompactionInputTokens(&claudeReq)
-	if gatewayEstimated <= clientKiroInputTokens {
+	if gatewayEstimated <= compactionLimit {
 		t.Fatalf("test setup expected gateway estimate above %d, got %d",
-			clientKiroInputTokens, gatewayEstimated)
+			compactionLimit, gatewayEstimated)
 	}
-	if exceedsKiroInputTokenLimit(gatewayEstimated) {
+	if exceedsKiroInputTokenLimit(gatewayEstimated, model) {
 		t.Fatalf("test setup expected gateway estimate below hard safety limit, got %d", gatewayEstimated)
 	}
 
@@ -144,7 +146,7 @@ func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rr, req)
 
-	assertPromptTooLongError(t, rr, gatewayEstimated)
+	assertPromptTooLongError(t, rr, gatewayEstimated, model)
 }
 
 func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
@@ -180,7 +182,7 @@ func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
 
 func TestOpenAIChatRejectsOverKiroInputTokenLimit(t *testing.T) {
 	body, err := json.Marshal(OpenAIRequest{
-		Model: "claude-opus-4.7",
+		Model: "claude-sonnet-4.5",
 		Messages: []OpenAIMessage{
 			{Role: "user", Content: oversizedInputText()},
 		},
@@ -200,7 +202,7 @@ func TestOpenAIChatRejectsOverKiroInputTokenLimit(t *testing.T) {
 
 func TestResponsesRejectsOverKiroInputTokenLimit(t *testing.T) {
 	body, err := json.Marshal(ResponsesRequest{
-		Model: "claude-opus-4.7",
+		Model: "claude-sonnet-4.5",
 		Input: json.RawMessage(`[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"` + oversizedInputText() + `"}]}
 		]`),
@@ -224,26 +226,31 @@ func TestBuildModelInfoAdvertisesClientCompactionLimit(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected tokenLimits on model info, got %#v", model["tokenLimits"])
 	}
-	if tokenLimits["maxInputTokens"] != clientKiroInputTokens {
-		t.Fatalf("expected maxInputTokens=%d, got %d", clientKiroInputTokens, tokenLimits["maxInputTokens"])
+	want := modelClientCompactionLimit("claude-opus-4.7")
+	if tokenLimits["maxInputTokens"] != want {
+		t.Fatalf("expected maxInputTokens=%d, got %d", want, tokenLimits["maxInputTokens"])
 	}
 }
 
 func TestClientCompactionLimitStaysWithinAdvertisedHardLimit(t *testing.T) {
-	if clientKiroInputTokens > maxKiroInputTokens {
-		t.Fatalf("client limit %d must not exceed hard limit %d", clientKiroInputTokens, maxKiroInputTokens)
-	}
-	if exceedsKiroInputTokenLimit(clientKiroInputTokens + 1) {
-		t.Fatalf("client compaction threshold must not be treated as a hard reject")
+	for _, model := range []string{"claude-sonnet-4.5", "claude-opus-4.7", "qwen3-coder-next"} {
+		compactionLimit := modelClientCompactionLimit(model)
+		if compactionLimit > modelHardInputTokenLimit(model) {
+			t.Fatalf("%s: client limit %d must not exceed hard limit %d", model, compactionLimit, modelHardInputTokenLimit(model))
+		}
+		if exceedsKiroInputTokenLimit(compactionLimit+1, model) {
+			t.Fatalf("%s: client compaction threshold must not be treated as a hard reject", model)
+		}
 	}
 }
 
 func TestEstimatorSafetyFactorDoesNotBlockCompactionHeadroom(t *testing.T) {
+	const model = "claude-sonnet-4.5"
 	estimated := estimateApproxTokens(strings.Repeat("context ", 185_000))
 	if estimated <= maxKiroInputTokens {
 		t.Fatalf("test setup expected corrected estimate above hard limit, got %d", estimated)
 	}
-	if exceedsKiroInputTokenLimit(estimated) {
+	if exceedsKiroInputTokenLimit(estimated, model) {
 		t.Fatalf("corrected estimate %d should remain inside hard-limit safety margin", estimated)
 	}
 }
@@ -386,7 +393,7 @@ func assertContextLimitError(t *testing.T, rr *httptest.ResponseRecorder) {
 	}
 }
 
-func assertPromptTooLongError(t *testing.T, rr *httptest.ResponseRecorder, estimatedInputTokens int) {
+func assertPromptTooLongError(t *testing.T, rr *httptest.ResponseRecorder, estimatedInputTokens int, model string) {
 	t.Helper()
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d with body %s", rr.Code, rr.Body.String())
@@ -403,7 +410,7 @@ func assertPromptTooLongError(t *testing.T, rr *httptest.ResponseRecorder, estim
 	for _, want := range []string{
 		"Prompt is too long",
 		"tokens",
-		"tokens > " + strconv.Itoa(clientKiroInputTokens),
+		"tokens > " + strconv.Itoa(modelClientCompactionLimit(model)),
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected response to contain %q, got %s", want, body)
