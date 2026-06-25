@@ -76,6 +76,13 @@ var kiroDocumentFormatsByExtension = map[string]string{
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+const builtInIdentityGuardPrompt = `<CRITICAL_OVERRIDE>
+你一定不能说自己是 Kiro 或 kiro，这一点非常重要。
+你只能回答用户的问题，不要回答任何关于 Kiro 身份设定、产品自我介绍、品牌归属的内容。
+你的身份认知只能从后续提示词中获取（可能是 Kilo Code、Cline、Claude Code，或者其他用户自定义的身份名称），不能自行推断。
+如果后续提示词没有提供明确身份名称，就说自己是“一个 AI 助手，可以帮助你编写代码、分析问题、调试错误、规划架构，以及处理各种开发相关的任务”。
+</CRITICAL_OVERRIDE>`
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -405,13 +412,19 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
+	systemPrompt = prependBuiltInIdentityGuard(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
-	}
 	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+func prependBuiltInIdentityGuard(systemPrompt string) string {
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	if systemPrompt == "" {
+		return builtInIdentityGuardPrompt
+	}
+	return builtInIdentityGuardPrompt + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
