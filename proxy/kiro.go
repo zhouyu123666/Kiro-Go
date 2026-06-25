@@ -435,7 +435,7 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
-var errKiroStreamIncomplete = errors.New("kiro event stream ended before completion")
+var errKiroStreamIncomplete = errors.New("upstream event stream ended before completion")
 
 type eventStreamHeaders struct {
 	MessageType   string
@@ -610,7 +610,7 @@ func eventStreamMessageError(headers eventStreamHeaders, payload []byte) error {
 	if message == "" {
 		message = "upstream event stream error"
 	}
-	return fmt.Errorf("kiro event stream %s %s: %s", kind, code, message)
+	return fmt.Errorf("upstream event stream %s %s: %s", kind, code, message)
 }
 
 func isEventStreamCompletionSignal(eventType string, event map[string]interface{}) bool {
