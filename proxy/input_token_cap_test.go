@@ -2,18 +2,25 @@ package proxy
 
 import "testing"
 
-func TestFinalizeKiroInputTokensUsesUpstreamInput(t *testing.T) {
-	got := finalizeKiroInputTokens(4397, 100, 50, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
+func TestFinalizeKiroInputTokensFallsBackToUpstreamInput(t *testing.T) {
+	got := finalizeKiroInputTokens(4397, 100, 50, maxKiroInputTokens, 0, "claude-sonnet-4.5")
 	if got != 4397 {
-		t.Fatalf("expected upstream input tokens to be preserved, got %d", got)
+		t.Fatalf("expected upstream input tokens when request estimate is unavailable, got %d", got)
 	}
 }
 
-func TestFinalizeKiroInputTokensUsesContextUsageBeforeEstimate(t *testing.T) {
-	got := finalizeKiroInputTokens(0, 1234, 2.5, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
+func TestFinalizeKiroInputTokensPrefersRequestEstimateOverContextUsage(t *testing.T) {
+	got := finalizeKiroInputTokens(0, 100, 50, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
+	if got != 9000 {
+		t.Fatalf("expected request-estimated input tokens, got %d", got)
+	}
+}
+
+func TestFinalizeKiroInputTokensFallsBackToContextUsage(t *testing.T) {
+	got := finalizeKiroInputTokens(0, 1234, 2.5, maxKiroInputTokens, 0, "claude-sonnet-4.5")
 	want := inputTokensFromContextUsagePercentage(2.5, maxKiroInputTokens, 1234)
 	if got != want {
-		t.Fatalf("expected context usage input tokens %d, got %d", want, got)
+		t.Fatalf("expected context usage input tokens when request and upstream estimates are unavailable: want %d, got %d", want, got)
 	}
 }
 

@@ -866,7 +866,15 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Gate on the converted payload (the exact upstream body) so PDF inlining,
 	// system priming and tool dedup are reflected in the estimate.
-	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
+	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
+	clientInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	if !ok {
+		logger.Warnf("[ClaudeContextGate] kiro-gateway request usage estimate unavailable; falling back to approximate token estimator")
+		clientInputTokens = estimateClaudeRequestInputTokens(effectiveReq)
+	}
+	if clientInputTokens < 1 {
+		clientInputTokens = 1
+	}
 	current := kiroPayload.ConversationState.CurrentMessage.UserInputMessage
 	currentTools := 0
 	currentToolResults := 0
@@ -874,22 +882,22 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		currentTools = len(current.UserInputMessageContext.Tools)
 		currentToolResults = len(current.UserInputMessageContext.ToolResults)
 	}
-	exceedsHardLimit := exceedsKiroInputTokenLimit(estimatedInputTokens, req.Model)
+	exceedsHardLimit := exceedsKiroInputTokenLimit(kiroPayloadInputTokens, req.Model)
 	logger.Debugf("[ClaudeContextGate] stage=kiroPayload model=%s actualModel=%s stream=%t estimatedInputTokens=%d hardLimit=%d exceedsHardLimit=%t history=%d currentContentChars=%d currentTools=%d currentToolResults=%d",
-		clientModel, req.Model, req.Stream, estimatedInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
+		clientModel, req.Model, req.Stream, kiroPayloadInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
 	if exceedsHardLimit {
-		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens, req.Model))
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(kiroPayloadInputTokens, req.Model))
 		return
 	}
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, clientInputTokens)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 

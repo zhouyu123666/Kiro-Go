@@ -6,7 +6,7 @@ import (
 	"unicode"
 )
 
-const claudeTokenCorrectionFactor = 1.05
+const claudeTokenCorrectionFactor = 1.1
 
 // Binary media (images, documents) is sent to the model as attachments, not as
 // the raw base64 string in the request body. Estimating these blocks by JSON-
@@ -320,15 +320,17 @@ func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []Kir
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
 }
 
-// Match Kiro billing to the full request context, not only the latest user turn.
+// Match public billing to the client-visible request context. Kiro's
+// contextUsagePercentage is backend context occupancy and can include hidden
+// service state, so use it only as a last-resort fallback when no request-side
+// estimate is available.
 func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
-	inputTokens := upstreamInputTokens
+	inputTokens := estimatedInputTokens
 	if inputTokens <= 0 {
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else {
-			inputTokens = estimatedInputTokens
-		}
+		inputTokens = upstreamInputTokens
+	}
+	if inputTokens <= 0 && contextUsagePercentage > 0 {
+		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
 	}
 	return capInputTokensToContextWindow(inputTokens, model)
 }

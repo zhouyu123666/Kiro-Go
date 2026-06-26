@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -93,6 +94,87 @@ func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	}
 	if item.TrialUsageCurrent != 5 || item.TrialUsageLimit != 50 || item.TrialUsagePercent != 0.1 || item.TrialUsagePercentage != 10 {
 		t.Fatalf("unexpected trial usage fields: %#v", item)
+	}
+}
+
+func TestClaudeMessagesReportsClientRequestInputTokens(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	if err := config.AddAccount(config.Account{
+		ID:          "acct",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "ok",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{
+			"contextUsagePercentage": 50.0,
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	reqBody := []byte(`{"model":"claude-sonnet-4.5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+	var claudeReq ClaudeRequest
+	if err := json.Unmarshal(reqBody, &claudeReq); err != nil {
+		t.Fatalf("decode test request: %v", err)
+	}
+	wantInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(&claudeReq)
+	if !ok {
+		wantInputTokens = estimateClaudeRequestInputTokens(&claudeReq)
+	}
+	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(ClaudeToKiro(&claudeReq, false))
+	if kiroPayloadInputTokens <= wantInputTokens {
+		t.Fatalf("test fixture must distinguish client estimate from Kiro payload estimate: client=%d kiro=%d", wantInputTokens, kiroPayloadInputTokens)
+	}
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(reqBody))
+	h.handleClaudeMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected request to succeed, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Usage.InputTokens != wantInputTokens {
+		t.Fatalf("expected client request input tokens %d, got %d (kiro payload estimate %d)", wantInputTokens, resp.Usage.InputTokens, kiroPayloadInputTokens)
 	}
 }
 
