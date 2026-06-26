@@ -24,17 +24,17 @@ func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 	}
 }
 
-func TestClaudeUsageMapKeepsDisplayInputWithCacheBreakdown(t *testing.T) {
+func TestClaudeUsageMapReportsFullInputWithCacheBreakdown(t *testing.T) {
 	totalInput := finalizeKiroInputTokens(0, 1038, 0, maxKiroInputTokens, 59081, "claude-haiku-4.5")
 	cacheUsage := promptCacheUsage{
 		CacheReadInputTokens:     42686,
 		CacheCreationInputTokens: 7533,
 	}
-	visibleInput := finalizeKiroDisplayInputTokens(1, totalInput, "claude-haiku-4.5")
-	usage := buildClaudeUsageMap(visibleInput, 1038, cacheUsage, true)
+	reportedInput := finalizeKiroReportedInputTokens(totalInput, "claude-haiku-4.5")
+	usage := buildClaudeUsageMap(reportedInput, 1038, cacheUsage, true)
 
-	if got := usage["input_tokens"]; got != 1 {
-		t.Fatalf("expected displayed input tokens to exclude prompt, got %#v", got)
+	if got := usage["input_tokens"]; got != totalInput {
+		t.Fatalf("expected reported input tokens to use full context input %d, got %#v", totalInput, got)
 	}
 	if got := usage["cache_read_input_tokens"]; got != 42686 {
 		t.Fatalf("expected cache read tokens to be preserved, got %#v", got)

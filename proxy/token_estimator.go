@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/json"
 	"math"
-	"strings"
 	"unicode"
 )
 
@@ -321,32 +320,6 @@ func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []Kir
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
 }
 
-func estimateClaudeLastUserInputTokens(req *ClaudeRequest) int {
-	if req == nil {
-		return 0
-	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if strings.TrimSpace(req.Messages[i].Role) != "user" {
-			continue
-		}
-		return estimateClaudeValueTokens(req.Messages[i].Content)
-	}
-	return 0
-}
-
-func estimateOpenAILastUserInputTokens(req *OpenAIRequest) int {
-	if req == nil {
-		return 0
-	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if strings.TrimSpace(req.Messages[i].Role) != "user" {
-			continue
-		}
-		return estimateOpenAIContentTokens(req.Messages[i].Content)
-	}
-	return 0
-}
-
 // Match Kiro billing to the full request context, not only the latest user turn.
 func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
 	inputTokens := upstreamInputTokens
@@ -360,9 +333,6 @@ func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsage
 	return capInputTokensToContextWindow(inputTokens, model)
 }
 
-func finalizeKiroDisplayInputTokens(displayInputTokens, fallbackInputTokens int, model string) int {
-	if displayInputTokens <= 0 {
-		displayInputTokens = fallbackInputTokens
-	}
-	return capInputTokensToContextWindow(displayInputTokens, model)
+func finalizeKiroReportedInputTokens(inputTokens int, model string) int {
+	return capInputTokensToContextWindow(inputTokens, model)
 }
