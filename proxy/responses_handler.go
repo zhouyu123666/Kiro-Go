@@ -119,21 +119,21 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
 	usageReportWindow := getClaudeCodeUsageReportWindow(actualModel)
-	userInputTokens := estimateOpenAILastUserInputTokens(openaiReq)
+	displayInputTokens := estimateOpenAILastUserInputTokens(openaiReq)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, userInputTokens,
+		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, displayInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, userInputTokens,
+	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, displayInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, userInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, displayInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -191,25 +191,15 @@ func (h *Handler) handleResponsesNonStream(
 		if outputTokens <= 0 {
 			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, visibleInputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -291,7 +281,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, userInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, displayInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -548,25 +538,15 @@ func (h *Handler) handleResponsesStream(
 		if outputTokens <= 0 {
 			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, visibleInputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

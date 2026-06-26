@@ -56,8 +56,8 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 
 	m := buildClaudeUsageMap(100, 50, usage, true)
 
-	if got := m["input_tokens"]; got != 50 {
-		t.Fatalf("expected billed input tokens 50, got %#v", got)
+	if got := m["input_tokens"]; got != 100 {
+		t.Fatalf("expected displayed input tokens 100, got %#v", got)
 	}
 	if got := m["cache_creation_input_tokens"]; got != 30 {
 		t.Fatalf("expected cache creation tokens 30, got %#v", got)
