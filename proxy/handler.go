@@ -918,7 +918,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := capInputTokensToContextWindow(estimatedInputTokens, model)
+	startInputTokens := finalizeKiroInputTokens(0, 0, 0, usageReportWindow, estimatedInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false

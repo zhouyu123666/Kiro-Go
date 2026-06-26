@@ -10,9 +10,9 @@ func TestFinalizeKiroInputTokensFallsBackToUpstreamInput(t *testing.T) {
 }
 
 func TestFinalizeKiroInputTokensPrefersRequestEstimateOverContextUsage(t *testing.T) {
-	got := finalizeKiroInputTokens(0, 100, 50, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
-	if got != 9000 {
-		t.Fatalf("expected request-estimated input tokens, got %d", got)
+	got := finalizeKiroInputTokens(0, 100, 50, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
+	if got != 1800 {
+		t.Fatalf("expected billable request-estimated input tokens, got %d", got)
 	}
 }
 
@@ -25,9 +25,9 @@ func TestFinalizeKiroInputTokensFallsBackToContextUsage(t *testing.T) {
 }
 
 func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
-	got := finalizeKiroInputTokens(0, 100, 0, maxKiroInputTokens, 4397, "claude-sonnet-4.5")
-	if got != 4397 {
-		t.Fatalf("expected estimated input tokens, got %d", got)
+	got := finalizeKiroInputTokens(0, 100, 0, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
+	if got != 1800 {
+		t.Fatalf("expected billable estimated input tokens, got %d", got)
 	}
 }
 
