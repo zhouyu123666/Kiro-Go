@@ -883,23 +883,19 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
-	// 报告用的输入 token 上限：仅本轮最后一条 user 消息的 token 数。
-	// 用于把展示/计费的输入 token 压到“用户实际输入”，避免一句 hi 被
-	// 计成系统提示词+工具定义的完整估算值。
-	userInputTokens := estimateClaudeLastUserInputTokens(&req)
-
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
+	displayInputTokens := estimateClaudeLastUserInputTokens(&req)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, userInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, displayInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, userInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, displayInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, userInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, displayInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -915,8 +911,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := capInputTokens(userInputTokens, estimatedInputTokens)
-	startInputTokens = capInputTokensToContextWindow(startInputTokens, model)
+	startInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, estimatedInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -1306,18 +1301,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if outputTokens <= 0 {
 			outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1336,7 +1321,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(visibleInputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1508,7 +1493,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, userInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, displayInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1577,18 +1562,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if outputTokens <= 0 {
 			outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1614,8 +1589,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
-		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, visibleInputTokens, outputTokens, model)
+		resp.Usage.InputTokens = visibleInputTokens
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if cacheProfile != nil {
@@ -1689,16 +1664,16 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
-	userInputTokens := estimateOpenAILastUserInputTokens(&req)
+	displayInputTokens := estimateOpenAILastUserInputTokens(&req)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, userInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, displayInputTokens, apiKeyID, usageReportWindow)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, userInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, displayInputTokens, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, userInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, displayInputTokens int, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2042,18 +2017,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				outputTokens += estimateApproxTokens(tc.Function.Arguments)
 			}
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2076,9 +2041,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"finish_reason": finishReason,
 			}},
 			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
+				"prompt_tokens":     visibleInputTokens,
 				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
+				"total_tokens":      visibleInputTokens + outputTokens,
 			},
 		}
 		data, _ := json.Marshal(chunk)
@@ -2098,7 +2063,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, userInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, displayInputTokens int, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2156,18 +2121,8 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if outputTokens <= 0 {
 			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 		}
-		// 输入 token 优先用 kiro 在 OnComplete 里返回的精确 inTok(此时
-		// inputTokens 已被赋为 kiro 真值且 >0)。kiro 没给 inTok 时,退回
-		// contextUsagePercentage 换算(必到场但偏粗),再退回本地估算。
-		if inputTokens <= 0 {
-			if contextUsagePercentage > 0 {
-				inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-			} else {
-				inputTokens = estimatedInputTokens
-			}
-		}
-		inputTokens = capInputTokens(userInputTokens, inputTokens)
-		inputTokens = capInputTokensToContextWindow(inputTokens, model)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2175,7 +2130,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, visibleInputTokens, outputTokens, model, thinkingFormat)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return

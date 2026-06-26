@@ -321,11 +321,6 @@ func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []Kir
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
 }
 
-// estimateClaudeLastUserInputTokens returns the estimated token count of the
-// last user-role message in the request. This is the "what the user actually
-// typed this turn" figure used to cap the displayed/recorded input tokens so a
-// short prompt is not reported as the full gateway estimate (system prompt +
-// tool definitions + history). Returns 0 when no user message is present.
 func estimateClaudeLastUserInputTokens(req *ClaudeRequest) int {
 	if req == nil {
 		return 0
@@ -339,8 +334,6 @@ func estimateClaudeLastUserInputTokens(req *ClaudeRequest) int {
 	return 0
 }
 
-// estimateOpenAILastUserInputTokens is the OpenAI-shaped counterpart of
-// estimateClaudeLastUserInputTokens.
 func estimateOpenAILastUserInputTokens(req *OpenAIRequest) int {
 	if req == nil {
 		return 0
@@ -354,16 +347,22 @@ func estimateOpenAILastUserInputTokens(req *OpenAIRequest) int {
 	return 0
 }
 
-// capInputTokens applies the reporting rule: when the user's own input is no
-// larger than the gateway-computed input tokens, report the user's input;
-// otherwise report the computed value. A non-positive userInputTokens (no user
-// message found) leaves the computed value untouched so display is never zeroed.
-func capInputTokens(userInputTokens, computedInputTokens int) int {
-	if userInputTokens <= 0 {
-		return computedInputTokens
+// Match Kiro billing to the full request context, not only the latest user turn.
+func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
+	inputTokens := upstreamInputTokens
+	if inputTokens <= 0 {
+		if contextUsagePercentage > 0 {
+			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		} else {
+			inputTokens = estimatedInputTokens
+		}
 	}
-	if userInputTokens <= computedInputTokens {
-		return userInputTokens
+	return capInputTokensToContextWindow(inputTokens, model)
+}
+
+func finalizeKiroDisplayInputTokens(displayInputTokens, fallbackInputTokens int, model string) int {
+	if displayInputTokens <= 0 {
+		displayInputTokens = fallbackInputTokens
 	}
-	return computedInputTokens
+	return capInputTokensToContextWindow(displayInputTokens, model)
 }
