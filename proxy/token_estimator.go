@@ -8,7 +8,7 @@ import (
 
 const (
 	claudeTokenCorrectionFactor        = 1.10
-	claudeBillingTokenCorrectionFactor = 1.80
+	claudeBillingTokenCorrectionFactor = 1.86
 )
 
 // Binary media (images, documents) is sent to the model as attachments, not as
