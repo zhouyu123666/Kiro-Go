@@ -2,39 +2,46 @@ package proxy
 
 import "testing"
 
-func TestFinalizeKiroInputTokensUsesUpstreamInput(t *testing.T) {
-	got := finalizeKiroInputTokens(4397, 100, 50, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
+func TestFinalizeKiroInputTokensFallsBackToUpstreamInput(t *testing.T) {
+	got := finalizeKiroInputTokens(4397, 100, 50, maxKiroInputTokens, 0, "claude-sonnet-4.5")
 	if got != 4397 {
-		t.Fatalf("expected upstream input tokens to be preserved, got %d", got)
+		t.Fatalf("expected upstream input tokens when request estimate is unavailable, got %d", got)
 	}
 }
 
-func TestFinalizeKiroInputTokensUsesContextUsageBeforeEstimate(t *testing.T) {
-	got := finalizeKiroInputTokens(0, 1234, 2.5, maxKiroInputTokens, 9000, "claude-sonnet-4.5")
+func TestFinalizeKiroInputTokensPrefersRequestEstimateOverContextUsage(t *testing.T) {
+	got := finalizeKiroInputTokens(0, 100, 50, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
+	if got != 1800 {
+		t.Fatalf("expected billable request-estimated input tokens, got %d", got)
+	}
+}
+
+func TestFinalizeKiroInputTokensFallsBackToContextUsage(t *testing.T) {
+	got := finalizeKiroInputTokens(0, 1234, 2.5, maxKiroInputTokens, 0, "claude-sonnet-4.5")
 	want := inputTokensFromContextUsagePercentage(2.5, maxKiroInputTokens, 1234)
 	if got != want {
-		t.Fatalf("expected context usage input tokens %d, got %d", want, got)
+		t.Fatalf("expected context usage input tokens when request and upstream estimates are unavailable: want %d, got %d", want, got)
 	}
 }
 
 func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
-	got := finalizeKiroInputTokens(0, 100, 0, maxKiroInputTokens, 4397, "claude-sonnet-4.5")
-	if got != 4397 {
-		t.Fatalf("expected estimated input tokens, got %d", got)
+	got := finalizeKiroInputTokens(0, 100, 0, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
+	if got != 1800 {
+		t.Fatalf("expected billable estimated input tokens, got %d", got)
 	}
 }
 
-func TestClaudeUsageMapKeepsDisplayInputWithCacheBreakdown(t *testing.T) {
+func TestClaudeUsageMapReportsFullInputWithCacheBreakdown(t *testing.T) {
 	totalInput := finalizeKiroInputTokens(0, 1038, 0, maxKiroInputTokens, 59081, "claude-haiku-4.5")
 	cacheUsage := promptCacheUsage{
 		CacheReadInputTokens:     42686,
 		CacheCreationInputTokens: 7533,
 	}
-	visibleInput := finalizeKiroDisplayInputTokens(1, totalInput, "claude-haiku-4.5")
-	usage := buildClaudeUsageMap(visibleInput, 1038, cacheUsage, true)
+	reportedInput := finalizeKiroReportedInputTokens(totalInput, "claude-haiku-4.5")
+	usage := buildClaudeUsageMap(reportedInput, 1038, cacheUsage, true)
 
-	if got := usage["input_tokens"]; got != 1 {
-		t.Fatalf("expected displayed input tokens to exclude prompt, got %#v", got)
+	if got := usage["input_tokens"]; got != totalInput {
+		t.Fatalf("expected reported input tokens to use full context input %d, got %#v", totalInput, got)
 	}
 	if got := usage["cache_read_input_tokens"]; got != 42686 {
 		t.Fatalf("expected cache read tokens to be preserved, got %#v", got)

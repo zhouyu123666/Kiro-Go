@@ -866,7 +866,15 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Gate on the converted payload (the exact upstream body) so PDF inlining,
 	// system priming and tool dedup are reflected in the estimate.
-	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
+	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
+	clientInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	if !ok {
+		logger.Warnf("[ClaudeContextGate] kiro-gateway request usage estimate unavailable; falling back to approximate token estimator")
+		clientInputTokens = estimateClaudeRequestInputTokens(effectiveReq)
+	}
+	if clientInputTokens < 1 {
+		clientInputTokens = 1
+	}
 	current := kiroPayload.ConversationState.CurrentMessage.UserInputMessage
 	currentTools := 0
 	currentToolResults := 0
@@ -874,28 +882,27 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		currentTools = len(current.UserInputMessageContext.Tools)
 		currentToolResults = len(current.UserInputMessageContext.ToolResults)
 	}
-	exceedsHardLimit := exceedsKiroInputTokenLimit(estimatedInputTokens, req.Model)
+	exceedsHardLimit := exceedsKiroInputTokenLimit(kiroPayloadInputTokens, req.Model)
 	logger.Debugf("[ClaudeContextGate] stage=kiroPayload model=%s actualModel=%s stream=%t estimatedInputTokens=%d hardLimit=%d exceedsHardLimit=%t history=%d currentContentChars=%d currentTools=%d currentToolResults=%d",
-		clientModel, req.Model, req.Stream, estimatedInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
+		clientModel, req.Model, req.Stream, kiroPayloadInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
 	if exceedsHardLimit {
-		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens, req.Model))
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(kiroPayloadInputTokens, req.Model))
 		return
 	}
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, clientInputTokens)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
-	displayInputTokens := estimateClaudeLastUserInputTokens(&req)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, displayInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, displayInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, displayInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -911,7 +918,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, estimatedInputTokens, model)
+	startInputTokens := finalizeKiroInputTokens(0, 0, 0, usageReportWindow, estimatedInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -1302,7 +1309,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
-		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1321,7 +1327,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(visibleInputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1493,7 +1499,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, displayInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1563,7 +1569,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
-		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1589,8 +1594,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, visibleInputTokens, outputTokens, model)
-		resp.Usage.InputTokens = visibleInputTokens
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		resp.Usage.InputTokens = inputTokens
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if cacheProfile != nil {
@@ -1664,16 +1669,15 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
-	displayInputTokens := estimateOpenAILastUserInputTokens(&req)
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, displayInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, displayInputTokens, apiKeyID, usageReportWindow)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, displayInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2018,7 +2022,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			}
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
-		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2041,9 +2044,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"finish_reason": finishReason,
 			}},
 			"usage": map[string]int{
-				"prompt_tokens":     visibleInputTokens,
+				"prompt_tokens":     inputTokens,
 				"completion_tokens": outputTokens,
-				"total_tokens":      visibleInputTokens + outputTokens,
+				"total_tokens":      inputTokens + outputTokens,
 			},
 		}
 		data, _ := json.Marshal(chunk)
@@ -2063,7 +2066,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, displayInputTokens int, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2122,7 +2125,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
-		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2130,7 +2132,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, visibleInputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return

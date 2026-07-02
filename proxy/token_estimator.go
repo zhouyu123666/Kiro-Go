@@ -3,11 +3,13 @@ package proxy
 import (
 	"encoding/json"
 	"math"
-	"strings"
 	"unicode"
 )
 
-const claudeTokenCorrectionFactor = 1.05
+const (
+	claudeTokenCorrectionFactor        = 1.10
+	claudeBillingTokenCorrectionFactor = 1.86
+)
 
 // Binary media (images, documents) is sent to the model as attachments, not as
 // the raw base64 string in the request body. Estimating these blocks by JSON-
@@ -321,48 +323,32 @@ func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []Kir
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
 }
 
-func estimateClaudeLastUserInputTokens(req *ClaudeRequest) int {
-	if req == nil {
+func applyClaudeBillingInputTokenCorrection(estimatedInputTokens int) int {
+	if estimatedInputTokens <= 0 {
 		return 0
 	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if strings.TrimSpace(req.Messages[i].Role) != "user" {
-			continue
-		}
-		return estimateClaudeValueTokens(req.Messages[i].Content)
-	}
-	return 0
+	return int(math.Ceil(float64(estimatedInputTokens) * claudeBillingTokenCorrectionFactor / claudeTokenCorrectionFactor))
 }
 
-func estimateOpenAILastUserInputTokens(req *OpenAIRequest) int {
-	if req == nil {
-		return 0
-	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if strings.TrimSpace(req.Messages[i].Role) != "user" {
-			continue
-		}
-		return estimateOpenAIContentTokens(req.Messages[i].Content)
-	}
-	return 0
-}
-
-// Match Kiro billing to the full request context, not only the latest user turn.
+// Match public billing to the client-visible request context. Request-side
+// estimates use the context-limit correction factor, then billing applies its
+// own multiplier so prompt-too-long checks can remain conservative and stable.
+// Kiro's contextUsagePercentage is backend context occupancy and can include
+// hidden service state, so use it only as a last-resort fallback when no
+// request-side estimate is available.
 func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
-	inputTokens := upstreamInputTokens
-	if inputTokens <= 0 {
-		if contextUsagePercentage > 0 {
-			inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
-		} else {
-			inputTokens = estimatedInputTokens
-		}
+	inputTokens := 0
+	if estimatedInputTokens > 0 {
+		inputTokens = applyClaudeBillingInputTokenCorrection(estimatedInputTokens)
+	} else if upstreamInputTokens > 0 {
+		inputTokens = upstreamInputTokens
+	}
+	if inputTokens <= 0 && contextUsagePercentage > 0 {
+		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
 	}
 	return capInputTokensToContextWindow(inputTokens, model)
 }
 
-func finalizeKiroDisplayInputTokens(displayInputTokens, fallbackInputTokens int, model string) int {
-	if displayInputTokens <= 0 {
-		displayInputTokens = fallbackInputTokens
-	}
-	return capInputTokensToContextWindow(displayInputTokens, model)
+func finalizeKiroReportedInputTokens(inputTokens int, model string) int {
+	return capInputTokensToContextWindow(inputTokens, model)
 }

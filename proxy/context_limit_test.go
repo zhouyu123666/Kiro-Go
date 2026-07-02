@@ -53,6 +53,13 @@ func TestClaudeCompactionEstimateUsesKiroGatewayTokenizer(t *testing.T) {
 	}
 }
 
+func TestModelEstimatedHardInputTokenLimitUsesContextEstimationFactor(t *testing.T) {
+	got := modelEstimatedHardInputTokenLimit("claude-opus-4.8")
+	if got != 1_100_000 {
+		t.Fatalf("expected 1M model hard estimate limit to use 1.10 context factor, got %d", got)
+	}
+}
+
 func TestClaudeToKiroDoesNotAutoTruncateOversizedHistory(t *testing.T) {
 	big := strings.Repeat("context ", 30_000)
 
