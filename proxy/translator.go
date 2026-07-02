@@ -84,10 +84,12 @@ const builtInIdentityGuardPrompt = `<CRITICAL_OVERRIDE>
 </CRITICAL_OVERRIDE>`
 
 const minimalFallbackUserContent = "."
+const kiroContinueContent = "Continue"
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 const toolResultDocumentPlaceholder = "[Tool returned a document; the document is attached to this message.]"
 const maxKiroDocuments = 5
+const keepHistoryImageThreshold = 5
 
 // maxInlinedPDFTextBytes caps the text extracted from a single PDF that gets
 // inlined into the message. The Kiro cloud accepts the documents field but does
@@ -233,6 +235,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	messages := mergeAdjacentClaudeMessages(req.Messages)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -240,14 +243,32 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	var currentImages []KiroImage
 	var currentDocuments []KiroDocument
 	var currentToolResults []KiroToolResult
+	prependSystemToCurrentMessage := false
 
-	for i, msg := range req.Messages {
-		isLast := i == len(req.Messages)-1
+	if systemPrompt != "" {
+		if len(messages) == 1 && messages[0].Role == "user" {
+			prependSystemToCurrentMessage = true
+		} else if len(messages) == 0 || messages[0].Role != "user" {
+			history = append(history, KiroHistoryMessage{
+				UserInputMessage: &KiroUserInputMessage{
+					Content: systemPrompt,
+					ModelID: modelID,
+					Origin:  origin,
+				},
+			})
+		}
+	}
+
+	for i, msg := range messages {
+		isLast := i == len(messages)-1
 
 		if msg.Role == "user" {
 			content, images, documents, toolResults := extractClaudeUserContent(msg.Content)
 			content, documents = inlinePDFDocuments(content, documents)
 			content = normalizeUserContent(content, len(images) > 0, len(documents) > 0)
+			if i == 0 && systemPrompt != "" && !prependSystemToCurrentMessage {
+				content = joinHistoryText(systemPrompt, content)
+			}
 
 			if isLast {
 				currentContent = content
@@ -288,25 +309,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	history = trimLeadingAssistantHistory(history)
 
-	// Keep system instructions in history instead of user content.
-	if systemPrompt != "" {
-		priming := []KiroHistoryMessage{
-			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: systemPrompt,
-					ModelID: modelID,
-					Origin:  origin,
-				},
-			},
-			{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content: "I will follow these instructions.",
-				},
-			},
-		}
-		history = append(priming, history...)
-	}
-
 	// Convert tools before history sanitization so completed tool turns in history
 	// can remain structured when we have enough tool metadata for Kiro to accept
 	// them. Without tools, fall back to the older text-only history path.
@@ -316,14 +318,15 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	keepCurrentToolResults := false
-	preserveHistoryTools := shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
+	canKeepCurrentToolResultsStructured := isSyntheticConversationAnchor(currentContent)
+	preserveHistoryTools := canKeepCurrentToolResultsStructured && shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
 	if preserveHistoryTools {
 		validatedToolResults, orphanedToolUseIDs := validateStructuredToolHistory(history, currentToolResults)
 		if len(validatedToolResults) == len(currentToolResults) {
 			currentToolResults = validatedToolResults
 			removeOrphanedToolUses(history, orphanedToolUseIDs)
 			kiroTools = appendMissingPlaceholderTools(kiroTools, collectHistoryToolNames(history))
-			keepCurrentToolResults = len(currentToolResults) > 0
+			keepCurrentToolResults = canKeepCurrentToolResultsStructured && len(currentToolResults) > 0
 			history = sanitizeKiroHistory(history, collectToolResultIDs(currentToolResults), true)
 		} else {
 			preserveHistoryTools = false
@@ -335,7 +338,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		// (orphaned tool results, e.g. after context compaction), flatten them into
 		// the current message text so the upstream does not reject the request.
 		currentToolResultIDs := collectToolResultIDs(currentToolResults)
-		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+		keepCurrentToolResults = canKeepCurrentToolResultsStructured && currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 		if keepCurrentToolResults {
 			history = sanitizeKiroHistory(history, currentToolResultIDs, false)
 		} else {
@@ -356,7 +359,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else if len(currentToolResults) > 0 {
 		finalContent = buildToolResultsContinuation(currentToolResults)
 	} else {
-		finalContent = minimalFallbackUserContent
+		finalContent = kiroContinueContent
+	}
+	if prependSystemToCurrentMessage {
+		finalContent = joinHistoryText(systemPrompt, finalContent)
 	}
 
 	// 构建 payload
@@ -365,7 +371,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content:   finalContent,
 		ModelID:   modelID,
@@ -397,6 +403,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	finalizeKiroPayload(payload)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -417,6 +424,77 @@ func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
 		return systemPrompt
 	}
 	return ThinkingModePrompt + "\n\n" + systemPrompt
+}
+
+func mergeAdjacentClaudeMessages(messages []ClaudeMessage) []ClaudeMessage {
+	if len(messages) <= 1 {
+		return messages
+	}
+	merged := make([]ClaudeMessage, 0, len(messages))
+	for _, msg := range messages {
+		if len(merged) == 0 || msg.Role != merged[len(merged)-1].Role {
+			merged = append(merged, msg)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		last.Content = mergeStructuredContent(last.Content, msg.Content)
+	}
+	return merged
+}
+
+func mergeAdjacentOpenAIMessages(messages []OpenAIMessage) []OpenAIMessage {
+	if len(messages) <= 1 {
+		return messages
+	}
+	merged := make([]OpenAIMessage, 0, len(messages))
+	for _, msg := range messages {
+		if len(merged) == 0 || msg.Role != merged[len(merged)-1].Role || msg.Role == "tool" {
+			merged = append(merged, msg)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		last.Content = mergeStructuredContent(last.Content, msg.Content)
+		last.ToolCalls = append(last.ToolCalls, msg.ToolCalls...)
+		if last.ToolCallID == "" {
+			last.ToolCallID = msg.ToolCallID
+		}
+	}
+	return merged
+}
+
+func mergeStructuredContent(left, right interface{}) interface{} {
+	if left == nil {
+		return right
+	}
+	if right == nil {
+		return left
+	}
+	leftString, leftIsString := left.(string)
+	rightString, rightIsString := right.(string)
+	if leftIsString && rightIsString {
+		return joinHistoryText(leftString, rightString)
+	}
+	blocks := contentAsBlocks(left)
+	blocks = append(blocks, contentAsBlocks(right)...)
+	return blocks
+}
+
+func contentAsBlocks(content interface{}) []interface{} {
+	switch v := content.(type) {
+	case nil:
+		return nil
+	case []interface{}:
+		out := make([]interface{}, len(v))
+		copy(out, v)
+		return out
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []interface{}{map[string]interface{}{"type": "text", "text": v}}
+	default:
+		return []interface{}{v}
+	}
 }
 
 func prependBuiltInIdentityGuard(systemPrompt string) string {
@@ -875,6 +953,7 @@ func extractToolResultContent(content interface{}) (string, []KiroImage, []KiroD
 
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
 	var text string
+	var thinkingText string
 	var toolUses []KiroToolUse
 
 	if s, ok := content.(string); ok {
@@ -894,6 +973,12 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 				if t, ok := block["text"].(string); ok {
 					text += t
 				}
+			case "thinking":
+				if t, ok := block["thinking"].(string); ok {
+					thinkingText += t
+				} else if t, ok := block["text"].(string); ok {
+					thinkingText += t
+				}
 			case "tool_use":
 				id, _ := block["id"].(string)
 				name, _ := block["name"].(string)
@@ -908,6 +993,10 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 				})
 			}
 		}
+	}
+	if strings.TrimSpace(thinkingText) != "" {
+		thinkingBlock := "<thinking>" + thinkingText + "</thinking>"
+		text = joinHistoryText(thinkingBlock, text)
 	}
 
 	return text, toolUses
@@ -1464,6 +1553,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			nonSystemMessages = append(nonSystemMessages, msg)
 		}
 	}
+	nonSystemMessages = mergeAdjacentOpenAIMessages(nonSystemMessages)
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
@@ -1476,6 +1566,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	var currentImages []KiroImage
 	var currentDocuments []KiroDocument
 	var currentToolResults []KiroToolResult
+	prependSystemToCurrentMessage := false
+
+	if strings.TrimSpace(systemPrompt) != "" {
+		if len(nonSystemMessages) == 1 && nonSystemMessages[0].Role == "user" {
+			prependSystemToCurrentMessage = true
+		} else if len(nonSystemMessages) == 0 || nonSystemMessages[0].Role != "user" {
+			history = append(history, KiroHistoryMessage{
+				UserInputMessage: &KiroUserInputMessage{
+					Content: strings.TrimSpace(systemPrompt),
+					ModelID: modelID,
+					Origin:  origin,
+				},
+			})
+		}
+	}
 
 	for i, msg := range nonSystemMessages {
 		isLast := i == len(nonSystemMessages)-1
@@ -1485,6 +1590,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			content, images, documents := extractOpenAIUserContent(msg.Content)
 			content, documents = inlinePDFDocuments(content, documents)
 			content = normalizeUserContent(content, len(images) > 0, len(documents) > 0)
+			if i == 0 && strings.TrimSpace(systemPrompt) != "" && !prependSystemToCurrentMessage {
+				content = joinHistoryText(strings.TrimSpace(systemPrompt), content)
+			}
 
 			if isLast {
 				currentContent = content
@@ -1576,36 +1684,18 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
-	// Keep system instructions in history instead of user content.
-	if systemPrompt != "" {
-		priming := []KiroHistoryMessage{
-			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: strings.TrimSpace(systemPrompt),
-					ModelID: modelID,
-					Origin:  origin,
-				},
-			},
-			{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content: "I will follow these instructions.",
-				},
-			},
-		}
-		history = append(priming, history...)
-	}
-
 	kiroTools := convertOpenAITools(req.Tools)
 
 	keepCurrentToolResults := false
-	preserveHistoryTools := shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
+	canKeepCurrentToolResultsStructured := isSyntheticConversationAnchor(currentContent)
+	preserveHistoryTools := canKeepCurrentToolResultsStructured && shouldPreserveStructuredHistoryTools(history, currentToolResults, len(kiroTools) > 0)
 	if preserveHistoryTools {
 		validatedToolResults, orphanedToolUseIDs := validateStructuredToolHistory(history, currentToolResults)
 		if len(validatedToolResults) == len(currentToolResults) {
 			currentToolResults = validatedToolResults
 			removeOrphanedToolUses(history, orphanedToolUseIDs)
 			kiroTools = appendMissingPlaceholderTools(kiroTools, collectHistoryToolNames(history))
-			keepCurrentToolResults = len(currentToolResults) > 0
+			keepCurrentToolResults = canKeepCurrentToolResultsStructured && len(currentToolResults) > 0
 			history = sanitizeKiroHistory(history, collectToolResultIDs(currentToolResults), true)
 		} else {
 			preserveHistoryTools = false
@@ -1615,7 +1705,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		// Decide whether current tool results form a valid active tool turn; if not,
 		// flatten them into the current message text (see ClaudeToKiro for rationale).
 		currentToolResultIDs := collectToolResultIDs(currentToolResults)
-		keepCurrentToolResults = currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+		keepCurrentToolResults = canKeepCurrentToolResultsStructured && currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 		if keepCurrentToolResults {
 			history = sanitizeKiroHistory(history, currentToolResultIDs, false)
 		} else {
@@ -1635,11 +1725,14 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		} else if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
-			finalContent = minimalFallbackUserContent
+			finalContent = kiroContinueContent
 		}
 	}
 	if len(currentToolResults) > 0 && !keepCurrentToolResults && currentContent != "" {
 		finalContent = joinHistoryText(currentContent, buildToolResultsContinuation(currentToolResults))
+	}
+	if prependSystemToCurrentMessage {
+		finalContent = joinHistoryText(strings.TrimSpace(systemPrompt), finalContent)
 	}
 
 	// 构建 payload
@@ -1675,6 +1768,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	finalizeKiroPayload(payload)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -2071,6 +2165,174 @@ func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMess
 		return nil
 	}
 	return history[idx:]
+}
+
+func finalizeKiroPayload(payload *KiroPayload) {
+	if payload == nil {
+		return
+	}
+
+	history := payload.ConversationState.History
+	history = trimLeadingAssistantHistory(history)
+	history = mergeAdjacentKiroHistory(history)
+	history = trimLeadingAssistantHistory(history)
+	dedupeKiroHistoryToolIDs(history)
+	slimOldHistoryImages(history)
+	if len(history) > 0 && history[len(history)-1].AssistantResponseMessage == nil {
+		history = append(history, KiroHistoryMessage{
+			AssistantResponseMessage: &KiroAssistantResponseMessage{Content: kiroContinueContent},
+		})
+	}
+	payload.ConversationState.History = history
+	if len(payload.ConversationState.History) == 0 {
+		payload.ConversationState.History = nil
+	}
+
+	current := &payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.UserInputMessageContext != nil {
+		current.UserInputMessageContext.ToolResults = dedupeKiroToolResults(current.UserInputMessageContext.ToolResults)
+		current.UserInputMessageContext.Tools = dedupeToolWrappers(current.UserInputMessageContext.Tools)
+		if len(current.UserInputMessageContext.Tools) == 0 && len(current.UserInputMessageContext.ToolResults) == 0 {
+			current.UserInputMessageContext = nil
+		}
+	}
+	if strings.TrimSpace(current.Content) == "" {
+		if current.UserInputMessageContext != nil && len(current.UserInputMessageContext.ToolResults) > 0 {
+			current.Content = "Tool results provided."
+		} else {
+			current.Content = kiroContinueContent
+		}
+	}
+}
+
+func mergeAdjacentKiroHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
+	if len(history) <= 1 {
+		return history
+	}
+	merged := make([]KiroHistoryMessage, 0, len(history))
+	for _, msg := range history {
+		if len(merged) == 0 {
+			merged = append(merged, msg)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		switch {
+		case last.UserInputMessage != nil && msg.UserInputMessage != nil:
+			mergeKiroUserMessages(last.UserInputMessage, msg.UserInputMessage)
+		case last.AssistantResponseMessage != nil && msg.AssistantResponseMessage != nil:
+			mergeKiroAssistantMessages(last.AssistantResponseMessage, msg.AssistantResponseMessage)
+		default:
+			merged = append(merged, msg)
+		}
+	}
+	return merged
+}
+
+func mergeKiroUserMessages(dst, src *KiroUserInputMessage) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Content = joinHistoryText(dst.Content, src.Content)
+	if dst.ModelID == "" {
+		dst.ModelID = src.ModelID
+	}
+	if dst.Origin == "" {
+		dst.Origin = src.Origin
+	}
+	dst.Images = append(dst.Images, src.Images...)
+	dst.Documents = appendKiroDocuments(dst.Documents, src.Documents...)
+	if src.UserInputMessageContext != nil {
+		if dst.UserInputMessageContext == nil {
+			dst.UserInputMessageContext = &UserInputMessageContext{}
+		}
+		dst.UserInputMessageContext.Tools = append(dst.UserInputMessageContext.Tools, src.UserInputMessageContext.Tools...)
+		dst.UserInputMessageContext.ToolResults = append(dst.UserInputMessageContext.ToolResults, src.UserInputMessageContext.ToolResults...)
+	}
+}
+
+func mergeKiroAssistantMessages(dst, src *KiroAssistantResponseMessage) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Content = joinHistoryText(dst.Content, src.Content)
+	dst.ToolUses = append(dst.ToolUses, src.ToolUses...)
+}
+
+func dedupeKiroHistoryToolIDs(history []KiroHistoryMessage) {
+	for i := range history {
+		if history[i].AssistantResponseMessage != nil {
+			history[i].AssistantResponseMessage.ToolUses = dedupeKiroToolUses(history[i].AssistantResponseMessage.ToolUses)
+		}
+		if history[i].UserInputMessage != nil && history[i].UserInputMessage.UserInputMessageContext != nil {
+			ctx := history[i].UserInputMessage.UserInputMessageContext
+			ctx.ToolResults = dedupeKiroToolResults(ctx.ToolResults)
+			ctx.Tools = dedupeToolWrappers(ctx.Tools)
+			if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
+				history[i].UserInputMessage.UserInputMessageContext = nil
+			}
+		}
+	}
+}
+
+func dedupeKiroToolUses(toolUses []KiroToolUse) []KiroToolUse {
+	if len(toolUses) <= 1 {
+		return toolUses
+	}
+	seen := make(map[string]bool, len(toolUses))
+	out := make([]KiroToolUse, 0, len(toolUses))
+	for _, toolUse := range toolUses {
+		key := strings.TrimSpace(toolUse.ToolUseID)
+		if key != "" {
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		out = append(out, toolUse)
+	}
+	return out
+}
+
+func dedupeKiroToolResults(toolResults []KiroToolResult) []KiroToolResult {
+	if len(toolResults) <= 1 {
+		return toolResults
+	}
+	seen := make(map[string]bool, len(toolResults))
+	out := make([]KiroToolResult, 0, len(toolResults))
+	for _, toolResult := range toolResults {
+		key := strings.TrimSpace(toolResult.ToolUseID)
+		if key != "" {
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		out = append(out, toolResult)
+	}
+	return out
+}
+
+func slimOldHistoryImages(history []KiroHistoryMessage) {
+	for i := range history {
+		msg := history[i].UserInputMessage
+		if msg == nil || len(msg.Images) == 0 {
+			continue
+		}
+		distanceFromEnd := len(history) - i
+		if distanceFromEnd <= keepHistoryImageThreshold {
+			continue
+		}
+		imageCount := len(msg.Images)
+		msg.Images = nil
+		msg.Content = joinHistoryText(msg.Content, omittedHistoryImagesPlaceholder(imageCount))
+	}
+}
+
+func omittedHistoryImagesPlaceholder(imageCount int) string {
+	if imageCount <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("[此消息包含 %d 张图片，已在历史记录中省略]", imageCount)
 }
 
 func firstClaudeConversationAnchor(messages []ClaudeMessage) string {

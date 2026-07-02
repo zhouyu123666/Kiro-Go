@@ -104,8 +104,6 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		openaiReq.MaxTokens = *req.MaxOutputTokens
 	}
 
-	clientModel := req.Model
-
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
@@ -113,28 +111,29 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	estimatedInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
-	if exceedsKiroInputTokenLimit(estimatedInputTokens) {
-		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens))
+	if exceedsKiroInputTokenLimit(estimatedInputTokens, actualModel) {
+		h.sendOpenAIError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(estimatedInputTokens, actualModel))
 		return
 	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
-	usageReportWindow := getClaudeCodeUsageReportWindow(clientModel)
+	usageReportWindow := getClaudeCodeUsageReportWindow(actualModel)
+	displayInputTokens := estimateOpenAILastUserInputTokens(openaiReq)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, displayInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, displayInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse, usageReportWindow)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, displayInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -158,7 +157,7 @@ func (h *Handler) handleResponsesNonStream(
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
+		var contextUsagePercentage float64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -172,7 +171,7 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -189,19 +188,18 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, visibleInputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -283,7 +281,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, displayInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 	usageReportWindow int,
 ) {
@@ -346,13 +344,13 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText               strings.Builder
+			reasoningText          strings.Builder
+			toolUses               []KiroToolUse
+			inputTokens            int
+			outputTokens           int
+			credits                float64
+			contextUsagePercentage float64
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -477,7 +475,7 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = inputTokensFromContextUsagePercentage(pct, usageReportWindow)
+				contextUsagePercentage = pct
 			},
 		}
 
@@ -537,19 +535,18 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+		if outputTokens <= 0 {
+			outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		visibleInputTokens := finalizeKiroDisplayInputTokens(displayInputTokens, inputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, visibleInputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

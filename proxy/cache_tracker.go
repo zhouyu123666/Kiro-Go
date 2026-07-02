@@ -506,13 +506,9 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 	return cache5m, cache1h
 }
 
-func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
-	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
-}
-
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
-		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
+		"input_tokens":  inputTokens,
 		"output_tokens": outputTokens,
 	}
 	if !includeCache {

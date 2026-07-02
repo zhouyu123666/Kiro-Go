@@ -400,7 +400,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(errBody))
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
@@ -435,7 +435,7 @@ func accountEmailForLog(account *config.Account) string {
 
 // ==================== Event Stream Parsing ====================
 
-var errKiroStreamIncomplete = errors.New("kiro event stream ended before completion")
+var errKiroStreamIncomplete = errors.New("upstream event stream ended before completion")
 
 type eventStreamHeaders struct {
 	MessageType   string
@@ -610,7 +610,7 @@ func eventStreamMessageError(headers eventStreamHeaders, payload []byte) error {
 	if message == "" {
 		message = "upstream event stream error"
 	}
-	return fmt.Errorf("kiro event stream %s %s: %s", kind, code, message)
+	return fmt.Errorf("upstream event stream %s %s: %s", kind, code, message)
 }
 
 func isEventStreamCompletionSignal(eventType string, event map[string]interface{}) bool {
