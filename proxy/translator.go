@@ -2146,11 +2146,7 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 		return minimalFallbackUserContent
 	}
 
-	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
-	if len(joined) > 4000 {
-		return joined[:4000]
-	}
-	return joined
+	return toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {

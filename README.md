@@ -112,9 +112,6 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
-| `KIRO_GO_RTK` | Enable request tool-output compression (`false`/`off` disables it) | `true` |
-| `KIRO_GO_RTK_MIN_BYTES` | Minimum tool-output size before RTK compression is attempted | `500` |
-| `KIRO_GO_RTK_MAX_BYTES` | Maximum tool-output size eligible for RTK compression | `10485760` |
 
 ## Contributing
 
