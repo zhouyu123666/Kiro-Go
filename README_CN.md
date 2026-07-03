@@ -112,9 +112,6 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
-| `KIRO_GO_RTK` | 启用请求工具输出压缩（设为 `false`/`off` 可关闭） | `true` |
-| `KIRO_GO_RTK_MIN_BYTES` | 触发 RTK 压缩的最小工具输出大小 | `500` |
-| `KIRO_GO_RTK_MAX_BYTES` | 允许 RTK 压缩的最大工具输出大小 | `10485760` |
 
 ## 参与贡献
 
