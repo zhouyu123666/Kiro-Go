@@ -277,6 +277,161 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
+func TestClaudeNonStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	if err := config.AddAccount(config.Account{
+		ID:          "acct",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "thinking only",
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-sonnet-4.5",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "", maxKiroInputTokens)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if resp.StopReason != "max_tokens" {
+		t.Fatalf("expected stop_reason=max_tokens, got %q body=%s", resp.StopReason, rec.Body.String())
+	}
+	if len(resp.Content) != 2 {
+		t.Fatalf("expected thinking block plus placeholder text block, got %#v", resp.Content)
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Thinking != "thinking only" {
+		t.Fatalf("expected thinking block to be preserved, got %#v", resp.Content[0])
+	}
+	if resp.Content[1].Type != "text" || resp.Content[1].Text != " " {
+		t.Fatalf("expected placeholder text block, got %#v", resp.Content[1])
+	}
+}
+
+func TestClaudeStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	if err := config.AddAccount(config.Account{
+		ID:          "acct",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "thinking only",
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: "claude-sonnet-4.5",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "", maxKiroInputTokens)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"stop_reason":"max_tokens"`) {
+		t.Fatalf("expected stream stop_reason=max_tokens, got body:\n%s", body)
+	}
+	if !strings.Contains(body, `"type":"text_delta"`) || !strings.Contains(body, `"text":" "`) {
+		t.Fatalf("expected placeholder text delta in stream, got body:\n%s", body)
+	}
+	if !strings.Contains(body, `"type":"thinking_delta"`) || !strings.Contains(body, `"thinking":"thinking only"`) {
+		t.Fatalf("expected thinking delta in stream, got body:\n%s", body)
+	}
+}
+
 func TestThinkingSourceTagFirst(t *testing.T) {
 	var source thinkingStreamSource
 
