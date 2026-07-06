@@ -189,6 +189,37 @@ func resolveClaudeThinkingResponseOptions(thinking *ClaudeThinkingConfig, defaul
 	return opts
 }
 
+// Some Claude clients treat a thinking-only turn as "no visible output". We
+// only count thinking as visible when it is rendered back into the text stream.
+func claudeThinkingRendersAsVisibleText(thinking bool, thinkingText string, thinkingOpts claudeThinkingResponseOptions) bool {
+	if !thinking || strings.TrimSpace(thinkingText) == "" {
+		return false
+	}
+
+	switch thinkingOpts.Format {
+	case "think", "reasoning_content":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldEmitClaudeThinkingPlaceholder(content, thinkingText string, toolUses []KiroToolUse, thinking bool, thinkingOpts claudeThinkingResponseOptions) bool {
+	if len(toolUses) > 0 || !thinking {
+		return false
+	}
+	if strings.TrimSpace(thinkingText) == "" {
+		return false
+	}
+	if strings.TrimSpace(content) != "" {
+		return false
+	}
+	if claudeThinkingRendersAsVisibleText(thinking, thinkingText, thinkingOpts) {
+		return false
+	}
+	return true
+}
+
 func validateOpenAIRequestShape(req *OpenAIRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
@@ -1299,10 +1330,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			thinkingOutput = ""
 		}
+		// Normalize a thinking-only turn into "max_tokens + placeholder text" so
+		// Claude-compatible clients do not prompt for a missing visible response.
+		emittedOnlyThinking := shouldEmitClaudeThinkingPlaceholder(outputContent, thinkingOutput, toolUses, thinking, thinkingOpts)
+		if emittedOnlyThinking {
+			startContentBlock("text")
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": activeBlockIndex,
+				"delta": map[string]string{"type": "text_delta", "text": " "},
+			})
+			closeActiveBlock()
+			outputContent = " "
+		}
 		// 输出 token 优先用 kiro 在 OnComplete 里返回的真值；只有当 kiro
 		// 没给(流未带 usage 帧等情况，outputTokens 仍为 0)时才本地估算兜底。
 		if outputTokens <= 0 {
 			outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		} else if emittedOnlyThinking {
+			outputTokens += estimateApproxTokens(" ")
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
 
@@ -1315,6 +1361,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
+		} else if emittedOnlyThinking {
+			stopReason = "max_tokens"
 		}
 
 		ensureMessageStart()
@@ -1560,9 +1608,16 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if !thinking {
 			rawThinkingContent = ""
 		}
-
+		// Non-stream responses need the same normalization as SSE to avoid
+		// returning a message that contains only thinking blocks.
+		emittedOnlyThinking := shouldEmitClaudeThinkingPlaceholder(finalContent, rawThinkingContent, toolUses, thinking, thinkingOpts)
+		if emittedOnlyThinking {
+			finalContent = " "
+		}
 		if outputTokens <= 0 {
 			outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		} else if emittedOnlyThinking {
+			outputTokens += estimateApproxTokens(" ")
 		}
 		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
 
@@ -1591,6 +1646,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		if emittedOnlyThinking {
+			resp.StopReason = "max_tokens"
+		}
 		resp.Usage.InputTokens = inputTokens
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
