@@ -167,7 +167,7 @@ func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing
 	assertPromptTooLongError(t, rr, gatewayEstimated, model)
 }
 
-func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
+func TestClaudeCountTokensUsesPublicEstimate(t *testing.T) {
 	claudeReq := ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -192,9 +192,15 @@ func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	want := estimateClaudeCompactionInputTokens(&claudeReq)
+	want, ok := estimateClaudeRequestRawTikTokenInputTokens(&claudeReq)
+	if !ok {
+		want = estimateClaudeRequestInputTokens(&claudeReq)
+	}
 	if got["input_tokens"] != want {
-		t.Fatalf("count_tokens input_tokens=%d, want gateway estimate %d", got["input_tokens"], want)
+		t.Fatalf("count_tokens input_tokens=%d, want public estimate %d", got["input_tokens"], want)
+	}
+	if gateway := estimateClaudeCompactionInputTokens(&claudeReq); got["input_tokens"] >= gateway {
+		t.Fatalf("count_tokens should not expose gateway safety estimate: got %d gateway %d", got["input_tokens"], gateway)
 	}
 }
 

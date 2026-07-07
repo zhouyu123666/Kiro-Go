@@ -33,26 +33,32 @@ func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensFallsBackToUpstreamUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamUsage(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 0, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 1234 {
-		t.Fatalf("expected upstream input tokens 1234, got %d", got)
+	if got != 9999 {
+		t.Fatalf("expected request estimate 9999 to win over upstream usage, got %d", got)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamAndContextUsage(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
-	if got != want {
-		t.Fatalf("expected context-derived input tokens %d over upstream usage, got %d", want, got)
+	if got != 9999 {
+		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
-	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
+func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 0, "claude-sonnet-4.5")
 	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
 	if got != want {
-		t.Fatalf("expected context-derived input tokens %d over request estimate, got %d", want, got)
+		t.Fatalf("expected context-derived fallback input tokens %d, got %d", want, got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverContextUsage(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
+	if got != 9999 {
+		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
 	}
 }
 
