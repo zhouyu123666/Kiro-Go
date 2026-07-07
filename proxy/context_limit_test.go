@@ -125,15 +125,26 @@ func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing.T) {
 	const model = "claude-sonnet-4.5"
 	compactionLimit := modelClientCompactionLimit(model)
-	repeatCount := compactionLimit*100/115 + 1_000
-	content := strings.Repeat("context ", repeatCount)
-	claudeReq := ClaudeRequest{
-		Model: model,
-		Messages: []ClaudeMessage{
-			{Role: "user", Content: content},
-		},
+	repeatCount := compactionLimit
+	var claudeReq ClaudeRequest
+	var gatewayEstimated int
+	for {
+		content := strings.Repeat("context ", repeatCount)
+		claudeReq = ClaudeRequest{
+			Model: model,
+			Messages: []ClaudeMessage{
+				{Role: "user", Content: content},
+			},
+		}
+		gatewayEstimated = estimateClaudeCompactionInputTokens(&claudeReq)
+		if gatewayEstimated > compactionLimit {
+			break
+		}
+		repeatCount += 1_000
+		if repeatCount > compactionLimit*4 {
+			t.Fatalf("test setup could not exceed compaction limit %d, last estimate %d", compactionLimit, gatewayEstimated)
+		}
 	}
-	gatewayEstimated := estimateClaudeCompactionInputTokens(&claudeReq)
 	if gatewayEstimated <= compactionLimit {
 		t.Fatalf("test setup expected gateway estimate above %d, got %d",
 			compactionLimit, gatewayEstimated)

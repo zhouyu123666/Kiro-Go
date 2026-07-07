@@ -11,7 +11,8 @@ func TestFinalizeKiroInputTokensFallsBackToUpstreamInput(t *testing.T) {
 
 func TestFinalizeKiroInputTokensPrefersRequestEstimateOverContextUsage(t *testing.T) {
 	got := finalizeKiroInputTokens(0, 100, 50, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
-	if got != 1800 {
+	want := applyClaudeBillingInputTokenCorrection(1100)
+	if got != want {
 		t.Fatalf("expected billable request-estimated input tokens, got %d", got)
 	}
 }
@@ -26,12 +27,43 @@ func TestFinalizeKiroInputTokensFallsBackToContextUsage(t *testing.T) {
 
 func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 	got := finalizeKiroInputTokens(0, 100, 0, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
-	if got != 1800 {
+	want := applyClaudeBillingInputTokenCorrection(1100)
+	if got != want {
 		t.Fatalf("expected billable estimated input tokens, got %d", got)
 	}
 }
 
-func TestClaudeUsageMapReportsFullInputWithCacheBreakdown(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensFallsBackToUpstreamUsage(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(1234, 100, 0, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
+	if got != 1234 {
+		t.Fatalf("expected upstream input tokens 1234, got %d", got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamUsage(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context-derived input tokens %d over upstream usage, got %d", want, got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context-derived input tokens %d over request estimate, got %d", want, got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensUsesRawEstimateWithoutBillingMultiplier(t *testing.T) {
+	got := finalizeClaudeUsageInputTokens(0, 100, 0, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
+	if got != 1100 {
+		t.Fatalf("expected raw request estimate 1100, got %d", got)
+	}
+}
+
+func TestClaudeUsageMapReportsUncachedInputWithCacheBreakdown(t *testing.T) {
 	totalInput := finalizeKiroInputTokens(0, 1038, 0, maxKiroInputTokens, 59081, "claude-haiku-4.5")
 	cacheUsage := promptCacheUsage{
 		CacheReadInputTokens:     42686,
@@ -40,14 +72,84 @@ func TestClaudeUsageMapReportsFullInputWithCacheBreakdown(t *testing.T) {
 	reportedInput := finalizeKiroReportedInputTokens(totalInput, "claude-haiku-4.5")
 	usage := buildClaudeUsageMap(reportedInput, 1038, cacheUsage, true)
 
-	if got := usage["input_tokens"]; got != totalInput {
-		t.Fatalf("expected reported input tokens to use full context input %d, got %#v", totalInput, got)
+	expectedUncachedInput := totalInput - cacheUsage.CacheReadInputTokens - cacheUsage.CacheCreationInputTokens
+	if got := usage["input_tokens"]; got != expectedUncachedInput {
+		t.Fatalf("expected reported input tokens to use uncached input %d, got %#v", expectedUncachedInput, got)
 	}
 	if got := usage["cache_read_input_tokens"]; got != 42686 {
 		t.Fatalf("expected cache read tokens to be preserved, got %#v", got)
 	}
 	if got := usage["cache_creation_input_tokens"]; got != 7533 {
 		t.Fatalf("expected cache creation tokens to be preserved, got %#v", got)
+	}
+	reconstructedTotal := usage["input_tokens"].(int) + usage["cache_read_input_tokens"].(int) + usage["cache_creation_input_tokens"].(int)
+	if reconstructedTotal != totalInput {
+		t.Fatalf("expected input + cache read + cache creation to reconstruct total input %d, got %d", totalInput, reconstructedTotal)
+	}
+}
+
+func TestClaudeUsageMapRebalancesCacheAgainstFinalTotal(t *testing.T) {
+	usage := promptCacheUsage{
+		CacheReadInputTokens:       80,
+		CacheCreationInputTokens:   20,
+		CacheCreation5mInputTokens: 8,
+		CacheCreation1hInputTokens: 12,
+		CacheCoveredEstimate:       100,
+		PromptTotalEstimate:        100,
+	}
+
+	m := buildClaudeUsageMap(50, 10, usage, true)
+
+	if m["input_tokens"].(int)+m["cache_read_input_tokens"].(int)+m["cache_creation_input_tokens"].(int) != 50 {
+		t.Fatalf("expected rebalance to preserve total input 50, got %#v", m)
+	}
+	if m["input_tokens"].(int) != claudeUsageEnvelopeMinTokens {
+		t.Fatalf("expected fully cached prompt to keep envelope floor %d, got %#v", claudeUsageEnvelopeMinTokens, m["input_tokens"])
+	}
+}
+
+func TestClaudeUsageMapScalesCacheAgainstPromptCoverageRatio(t *testing.T) {
+	usage := promptCacheUsage{
+		CacheReadInputTokens:       80,
+		CacheCreationInputTokens:   20,
+		CacheCreation5mInputTokens: 8,
+		CacheCreation1hInputTokens: 12,
+		CacheCoveredEstimate:       100,
+		PromptTotalEstimate:        200,
+	}
+
+	m := buildClaudeUsageMap(50, 10, usage, true)
+
+	if got := m["input_tokens"]; got != 25 {
+		t.Fatalf("expected 25 uncached tokens after ratio scaling, got %#v", got)
+	}
+	if got := m["cache_read_input_tokens"]; got != 20 {
+		t.Fatalf("expected read cache to scale to 20, got %#v", got)
+	}
+	if got := m["cache_creation_input_tokens"]; got != 5 {
+		t.Fatalf("expected creation cache to scale to 5, got %#v", got)
+	}
+	if m["input_tokens"].(int)+m["cache_read_input_tokens"].(int)+m["cache_creation_input_tokens"].(int) != 50 {
+		t.Fatalf("expected usage fields to reconstruct total input 50, got %#v", m)
+	}
+}
+
+func TestClaudeUsageMapAppliesEnvelopeFloorWhenCacheConsumesAllPublicInput(t *testing.T) {
+	usage := promptCacheUsage{
+		CacheCreationInputTokens:   10,
+		CacheReadInputTokens:       30,
+		CacheCreation5mInputTokens: 10,
+		CacheCoveredEstimate:       40,
+		PromptTotalEstimate:        40,
+	}
+
+	m := buildClaudeUsageMap(40, 1, usage, true)
+
+	if got := m["input_tokens"]; got != claudeUsageEnvelopeMinTokens {
+		t.Fatalf("expected envelope floor %d, got %#v", claudeUsageEnvelopeMinTokens, got)
+	}
+	if m["input_tokens"].(int)+m["cache_read_input_tokens"].(int)+m["cache_creation_input_tokens"].(int) != 40 {
+		t.Fatalf("expected usage fields to reconstruct total input 40, got %#v", m)
 	}
 }
 

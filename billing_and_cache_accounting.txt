@@ -1,0 +1,230 @@
+Kiro-Go 计费与缓存计量说明
+
+本文档说明 当前的 token 计费与 prompt cache 计量规则。
+
+1. 说明范围
+
+以下规则只描述 Kiro-Go 本地的计量、缓存拆账和对客户端返回的 usage 字段。
+
+它们不是 Amazon Kiro 上游的官方内部计费规则说明。
+
+2. 输入 token 口径
+
+当前对客户端返回的 usage.input_tokens 是“公开口径”的未缓存输入。
+
+它不是：
+
+- 纯本地估算值
+- 也不是上游真实内部 billable 值
+- 更不是“完整输入 total”原样透传
+
+它是 public_total_input 在拆出 cache_read / cache_creation 之后剩余的可见未缓存输入。
+
+
+3. 对外 public total input 的来源优先级
+
+Claude 兼容接口在生成公开 usage 时，会按下面顺序确定 public total input：
+
+1. contextUsagePercentage 推导值
+2. 上游 usage 里的 inputTokens（如果存在）
+3. 本地请求估算值
+
+得到 public total input 后，还会再经过模型上下文窗口限制的 clamp。
+
+如果走的是 contextUsagePercentage 路径，当前公式是：
+
+  public_total_input = round(context_window * contextUsagePercentage / 100) - output_tokens
+
+这里的 output_tokens 指同一次响应最终算出来的输出 token。
+
+也就是说，public_total_input 是“输入侧的总量”，不包含输出 token。
+
+4. Prompt cache namespace
+
+当前 prompt cache namespace 只按上游 account.ID 划分。
+
+格式：
+  <account.ID>
+
+5. Prompt cache 命中 / 写入规则
+
+Kiro-Go 会基于以下内容构建 cache profile：
+
+- request prelude
+- tools
+- system blocks
+- messages
+
+缓存断点来源：
+
+- 显式 cache_control 断点
+- 在首次显式 cache_control 之后的 message-end 隐式断点
+
+当前实现里的几个关键细节：
+- system 中第一个显式 cache_control 之前的动态前缀不会参与稳定缓存后缀
+- Anthropic billing header block 不参与 cache fingerprint
+- cache hit 不会续 TTL
+- 只有请求成功完成后才会 Update 本地 cache
+
+6. 模型最小可缓存阈值
+
+最小 cacheable prefix 大小：
+
+- Opus 家族：4096 tokens
+- 其他支持的 Claude 家族：1024 tokens
+
+如果最后一个 cacheable breakpoint 没过阈值：
+
+- cache_creation_input_tokens = 0
+- cache_read_input_tokens = 0
+
+因此同一个 payload 在 Sonnet 上可能能看到 cache 读写，在 Opus 上则可能完全看不到。
+
+7. Public cache 拆账规则
+
+Kiro-Go 会先在本地 tracker 中算出一组“原始缓存估算值（estimate 口径）”，
+再把它们映射到最终 public total input。
+
+7.1 原始 cache 数怎么来
+
+tracker 会先基于请求内容构建 cache profile：
+
+- request prelude
+- tools
+- system
+- messages
+
+然后把这些内容累计成一串 breakpoint，每个 breakpoint 都有：
+
+- cumulative_tokens
+- fingerprint
+- TTL
+
+接着从最后一个 cacheable breakpoint 开始向前找：
+
+- 找到的最深命中 breakpoint = matched_tokens
+- 最后一个 cacheable breakpoint 的 cumulative_tokens = last_tokens
+
+于是原始 cache 数为：
+
+  raw_cache_read = matched_tokens
+  raw_cache_creation = last_tokens - matched_tokens
+
+第一次请求通常是：
+
+  raw_cache_read = 0
+  raw_cache_creation = last_tokens
+
+完全命中稳定前缀时通常是：
+
+  raw_cache_read > 0
+  raw_cache_creation = 0 或很小
+
+7.2 tracker 额外保留的两个估算基准
+
+为了把原始 cache 数映射到最终 public_total_input，
+当前实现还会保留两个 estimate 口径基准：
+
+- cache_covered_est
+- prompt_total_est
+
+其中：
+
+  cache_covered_est = 原始 cache_read + 原始 cache_creation
+  prompt_total_est  = 本地估算的完整输入总量
+
+7.3 缩放到 public total input
+
+Kiro-Go 先算缓存覆盖比例：
+
+  coverage_ratio = cache_covered_est / prompt_total_est
+
+再把这个比例映射到最终 public_total_input：
+
+  scaled_cache_total = public_total_input * coverage_ratio
+
+然后按原始 read / creation 的占比继续拆：
+
+  public_cache_read =
+      scaled_cache_total * raw_cache_read / (raw_cache_read + raw_cache_creation)
+
+  public_cache_creation =
+      scaled_cache_total - public_cache_read
+
+最后：
+
+  visible_input = public_total_input - public_cache_read - public_cache_creation
+
+如果 visible_input 小于 floor，则会触发第 8 节的未缓存保底修正。
+
+最终对外保持以下关系：
+
+  input_tokens + cache_creation_input_tokens + cache_read_input_tokens = public_total_input
+
+8. Envelope floor / 未缓存保底
+
+如果 cache 覆盖几乎吃掉了整个 public total input，
+Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的未缓存保底值。
+
+当前保底值：
+
+  usage.input_tokens >= 6
+
+这是有意为之。
+
+原因：
+
+- 严格按比例拆账时，数学上可能出现 input_tokens = 0
+- 但对客户端和日志解释来说，完全为 0 往往不够直观
+- 因此保留一个很小的 envelope floor，更符合实际观感
+
+9. 典型行为预期
+
+同一大前缀、第一次请求：
+
+- cache_creation_input_tokens > 0
+- cache_read_input_tokens = 0
+
+同一大前缀、第二次同账号重复请求：
+
+- cache_read_input_tokens > 0
+- cache_creation_input_tokens = 0 或极小
+
+稳定前缀 + 仅尾巴变化：
+
+- cache_read_input_tokens > 0
+- cache_creation_input_tokens > 0
+
+10. 本地验证建议
+
+推荐本地验证模型：
+
+  claude-sonnet-4-6
+
+原因：
+
+- 最小 cacheable threshold 更低
+- 比 Opus 更容易打出 creation/read 行为
+
+建议的验证顺序：
+
+1. 发一条带 cache_control 的大前缀请求
+2. 重复发完全相同的请求
+3. 只修改尾巴内容再发
+
+预期现象：
+
+1. creation
+2. read
+3. read + 小 creation
+
+11. 当前设计取舍
+
+当前设计更偏向：
+
+- 对外 usage 语义清晰
+- cache 读写可解释
+- 对 Claude Code / Anthropic 兼容面更稳定
+
+它不追求和 Kiro 上游内部真实计费逐字段完全一致，
+而是追求“本地可观测、可复现、可解释”的 usage 行为。

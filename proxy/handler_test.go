@@ -97,7 +97,7 @@ func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	}
 }
 
-func TestClaudeMessagesReportsBillableClientRequestInputTokens(t *testing.T) {
+func TestClaudeMessagesReportsContextUsageDerivedPublicInputTokens(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -150,7 +150,6 @@ func TestClaudeMessagesReportsBillableClientRequestInputTokens(t *testing.T) {
 	if !ok {
 		wantInputTokens = estimateClaudeRequestInputTokens(&claudeReq)
 	}
-	wantReportedInputTokens := finalizeKiroInputTokens(0, 0, 0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model)
 	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(ClaudeToKiro(&claudeReq, false))
 	if kiroPayloadInputTokens <= wantInputTokens {
 		t.Fatalf("test fixture must distinguish client estimate from Kiro payload estimate: client=%d kiro=%d", wantInputTokens, kiroPayloadInputTokens)
@@ -174,8 +173,10 @@ func TestClaudeMessagesReportsBillableClientRequestInputTokens(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
+	expectedOutputTokens := estimateClaudeOutputTokens("ok", "", nil)
+	wantReportedInputTokens := finalizeClaudeUsageInputTokens(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model)
 	if resp.Usage.InputTokens != wantReportedInputTokens {
-		t.Fatalf("expected billable client request input tokens %d, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
+		t.Fatalf("expected public input tokens %d from context usage, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
 	}
 }
 
