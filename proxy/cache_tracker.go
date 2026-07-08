@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"kiro-go/logger"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,12 +20,15 @@ const defaultPromptCacheTTL = 5 * time.Minute
 // short requests.
 const defaultMinCacheableTokens = 1024
 const opusMinCacheableTokens = 4096
+const claudeUsageEnvelopeMinTokens = 6
 
 type promptCacheUsage struct {
 	CacheCreationInputTokens   int
 	CacheReadInputTokens       int
 	CacheCreation5mInputTokens int
 	CacheCreation1hInputTokens int
+	CacheCoveredEstimate       int
+	PromptTotalEstimate        int
 }
 
 type promptCacheBreakpoint struct {
@@ -111,6 +115,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 
 	if len(breakpoints) == 0 {
+		logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=0", req.Model, totalInputTokens)
 		return nil
 	}
 
@@ -118,15 +123,28 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		totalInputTokens = cumulativeTokens
 	}
 
-	return &promptCacheProfile{
+	profile := &promptCacheProfile{
 		Breakpoints:      breakpoints,
 		TotalInputTokens: totalInputTokens,
 		Model:            req.Model,
 	}
+	lastTokens := 0
+	if len(profile.Breakpoints) > 0 {
+		lastTokens = profile.Breakpoints[len(profile.Breakpoints)-1].CumulativeTokens
+	}
+	logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=%d last_breakpoint_tokens=%d",
+		req.Model, totalInputTokens, len(profile.Breakpoints), lastTokens)
+	return profile
 }
 
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+		logger.Debugf("[PromptCache] compute namespace=%q skipped profile_nil=%t breakpoints=%d", accountID, profile == nil, func() int {
+			if profile == nil {
+				return 0
+			}
+			return len(profile.Breakpoints)
+		}())
 		return promptCacheUsage{}
 	}
 
@@ -147,20 +165,17 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 			effectiveCreation = 0
 		}
 		cache5m, cache1h := computePromptCacheTTLBreakdown(profile, 0)
-		return promptCacheUsage{
+		usage := promptCacheUsage{
 			CacheCreationInputTokens:   effectiveCreation,
 			CacheReadInputTokens:       0,
 			CacheCreation5mInputTokens: cache5m,
 			CacheCreation1hInputTokens: cache1h,
+			CacheCoveredEstimate:       effectiveCreation,
+			PromptTotalEstimate:        profile.TotalInputTokens,
 		}
-	}
-
-	// Cap cacheable tokens at 85% of total input to ensure a realistic
-	// uncached portion. The newest content in a request is never fully
-	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.85)
-	if lastTokens > maxCacheable {
-		lastTokens = maxCacheable
+		logger.Debugf("[PromptCache] compute namespace=%q entries=0 total_input=%d min_tokens=%d last_tokens=%d result={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
+			accountID, profile.TotalInputTokens, minTokens, lastTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens, usage.CacheCoveredEstimate, usage.PromptTotalEstimate)
+		return usage
 	}
 
 	matchedTokens := 0
@@ -174,8 +189,6 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		if !ok || entry.ExpiresAt.Before(now) {
 			continue
 		}
-		entry.ExpiresAt = now.Add(entry.TTL)
-		entries[breakpoint.Fingerprint] = entry
 		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
 		if matchedTokens > lastTokens {
 			matchedTokens = lastTokens
@@ -185,12 +198,17 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 
 	creation := maxInt(lastTokens-matchedTokens, 0)
 	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens)
-	return promptCacheUsage{
+	usage := promptCacheUsage{
 		CacheCreationInputTokens:   creation,
 		CacheReadInputTokens:       matchedTokens,
 		CacheCreation5mInputTokens: cache5m,
 		CacheCreation1hInputTokens: cache1h,
+		CacheCoveredEstimate:       lastTokens,
+		PromptTotalEstimate:        profile.TotalInputTokens,
 	}
+	logger.Debugf("[PromptCache] compute namespace=%q entries=%d total_input=%d min_tokens=%d last_tokens=%d matched_tokens=%d result={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
+		accountID, len(entries), profile.TotalInputTokens, minTokens, lastTokens, matchedTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens, usage.CacheCoveredEstimate, usage.PromptTotalEstimate)
+	return usage
 }
 
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
@@ -295,7 +313,11 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 			},
 		}, false)
 	case []interface{}:
+		startIndex := firstExplicitPromptCacheBlockIndex(v)
 		for i, block := range v {
+			if i < startIndex {
+				continue
+			}
 			appendPromptBlock(blocks, map[string]interface{}{
 				"kind":         "system",
 				"system_index": i,
@@ -314,6 +336,15 @@ func appendSystemCacheBlocks(blocks *[]cacheablePromptBlock, system interface{})
 			}, false)
 		}
 	}
+}
+
+func firstExplicitPromptCacheBlockIndex(blocks []interface{}) int {
+	for i, block := range blocks {
+		if normalizePromptCacheTTL(extractPromptCacheTTL(block)) > 0 {
+			return i
+		}
+	}
+	return 0
 }
 
 func appendMessageCacheBlocks(blocks *[]cacheablePromptBlock, messageIndex int, msg ClaudeMessage) {
@@ -507,8 +538,9 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 }
 
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+	visibleInputTokens, usage := claudeUsageBreakdown(inputTokens, usage, includeCache)
 	result := map[string]interface{}{
-		"input_tokens":  inputTokens,
+		"input_tokens":  visibleInputTokens,
 		"output_tokens": outputTokens,
 	}
 	if !includeCache {
@@ -521,6 +553,126 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
 	}
 	return result
+}
+
+func claudeUsageBreakdown(totalInputTokens int, usage promptCacheUsage, includeCache bool) (int, promptCacheUsage) {
+	if totalInputTokens < 0 {
+		totalInputTokens = 0
+	}
+	if !includeCache {
+		return totalInputTokens, promptCacheUsage{}
+	}
+
+	usage = rebalancePromptCacheUsage(totalInputTokens, usage)
+	cachedInputTokens := usage.CacheReadInputTokens + usage.CacheCreationInputTokens
+	if cachedInputTokens <= 0 {
+		return totalInputTokens, usage
+	}
+	if cachedInputTokens > totalInputTokens {
+		cachedInputTokens = totalInputTokens
+	}
+	visibleInputTokens := totalInputTokens - cachedInputTokens
+	visibleInputTokens, usage = applyClaudeUsageEnvelopeFloor(totalInputTokens, visibleInputTokens, usage)
+	return visibleInputTokens, usage
+}
+
+func rebalancePromptCacheUsage(totalInputTokens int, usage promptCacheUsage) promptCacheUsage {
+	if totalInputTokens <= 0 {
+		return promptCacheUsage{}
+	}
+
+	readTokens := maxInt(usage.CacheReadInputTokens, 0)
+	creationTokens := maxInt(usage.CacheCreationInputTokens, 0)
+	cachedInputTokens := readTokens + creationTokens
+	if cachedInputTokens <= 0 {
+		usage.CacheReadInputTokens = 0
+		usage.CacheCreationInputTokens = 0
+		usage.CacheCreation5mInputTokens = 0
+		usage.CacheCreation1hInputTokens = 0
+		usage.CacheCoveredEstimate = 0
+		return usage
+	}
+
+	scaledCacheTotal := cachedInputTokens
+	rawCovered := maxInt(usage.CacheCoveredEstimate, 0)
+	rawPromptTotal := maxInt(usage.PromptTotalEstimate, 0)
+	if rawCovered > 0 && rawPromptTotal > 0 {
+		scaledCacheTotal = proportionalInt(totalInputTokens, rawCovered, rawPromptTotal)
+	}
+	if scaledCacheTotal > totalInputTokens {
+		scaledCacheTotal = totalInputTokens
+	}
+
+	readTokens = proportionalInt(scaledCacheTotal, readTokens, cachedInputTokens)
+	creationTokens = scaledCacheTotal - readTokens
+	cache5m, cache1h := rebalanceCacheCreationTTL(creationTokens, usage)
+	return promptCacheUsage{
+		CacheCreationInputTokens:   creationTokens,
+		CacheReadInputTokens:       readTokens,
+		CacheCreation5mInputTokens: cache5m,
+		CacheCreation1hInputTokens: cache1h,
+		CacheCoveredEstimate:       scaledCacheTotal,
+		PromptTotalEstimate:        totalInputTokens,
+	}
+}
+
+func rebalanceCacheCreationTTL(creationTokens int, usage promptCacheUsage) (int, int) {
+	if creationTokens <= 0 {
+		return 0, 0
+	}
+
+	raw5m := maxInt(usage.CacheCreation5mInputTokens, 0)
+	raw1h := maxInt(usage.CacheCreation1hInputTokens, 0)
+	rawTTL := raw5m + raw1h
+	if rawTTL <= 0 {
+		return creationTokens, 0
+	}
+
+	cache5m := proportionalInt(creationTokens, raw5m, rawTTL)
+	return cache5m, creationTokens - cache5m
+}
+
+func proportionalInt(total, numerator, denominator int) int {
+	if total <= 0 || numerator <= 0 || denominator <= 0 {
+		return 0
+	}
+	value := (int64(total)*int64(numerator) + int64(denominator)/2) / int64(denominator)
+	if value > int64(total) {
+		return total
+	}
+	return int(value)
+}
+
+func applyClaudeUsageEnvelopeFloor(totalInputTokens, visibleInputTokens int, usage promptCacheUsage) (int, promptCacheUsage) {
+	if totalInputTokens <= 0 {
+		return 0, usage
+	}
+	if visibleInputTokens >= claudeUsageEnvelopeMinTokens {
+		return visibleInputTokens, usage
+	}
+
+	desiredVisibleTokens := minInt(claudeUsageEnvelopeMinTokens, totalInputTokens)
+	cacheBudget := totalInputTokens - desiredVisibleTokens
+	if cacheBudget < 0 {
+		cacheBudget = 0
+	}
+
+	cachedInputTokens := maxInt(usage.CacheReadInputTokens, 0) + maxInt(usage.CacheCreationInputTokens, 0)
+	if cachedInputTokens <= 0 {
+		return desiredVisibleTokens, usage
+	}
+
+	readTokens := proportionalInt(cacheBudget, maxInt(usage.CacheReadInputTokens, 0), cachedInputTokens)
+	creationTokens := cacheBudget - readTokens
+	cache5m, cache1h := rebalanceCacheCreationTTL(creationTokens, usage)
+	return desiredVisibleTokens, promptCacheUsage{
+		CacheCreationInputTokens:   creationTokens,
+		CacheReadInputTokens:       readTokens,
+		CacheCreation5mInputTokens: cache5m,
+		CacheCreation1hInputTokens: cache1h,
+		CacheCoveredEstimate:       cacheBudget,
+		PromptTotalEstimate:        totalInputTokens,
+	}
 }
 
 func canonicalizeCacheValue(value interface{}) string {

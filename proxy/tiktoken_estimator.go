@@ -25,6 +25,14 @@ func getTikTokenEncoder() (*tiktoken.Tiktoken, error) {
 }
 
 func estimateClaudeRequestTikTokenInputTokens(req *ClaudeRequest) (int, bool) {
+	rawTokens, ok := estimateClaudeRequestRawTikTokenInputTokens(req)
+	if !ok {
+		return 0, false
+	}
+	return applyClaudeTikTokenCorrection(rawTokens), true
+}
+
+func estimateClaudeRequestRawTikTokenInputTokens(req *ClaudeRequest) (int, bool) {
 	if req == nil {
 		return 0, true
 	}
@@ -69,9 +77,7 @@ func estimateClaudeRequestTikTokenInputTokens(req *ClaudeRequest) (int, bool) {
 		toolTokens += nameTokens + descTokens + schemaTokens
 	}
 
-	return applyClaudeTikTokenCorrection(systemTokens) +
-		applyClaudeTikTokenCorrection(messageTokens) +
-		applyClaudeTikTokenCorrection(toolTokens), true
+	return systemTokens + messageTokens + toolTokens, true
 }
 
 func applyClaudeTikTokenCorrection(tokens int) int {

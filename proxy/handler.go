@@ -820,9 +820,9 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
-	estimatedTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	estimatedTokens, ok := estimateClaudeRequestRawTikTokenInputTokens(effectiveReq)
 	if !ok {
-		logger.Warnf("[ClaudeContextGate] kiro-gateway count_tokens estimate unavailable; falling back to approximate token estimator")
+		logger.Warnf("[ClaudeContextGate] public count_tokens estimate unavailable; falling back to approximate token estimator")
 		estimatedTokens = estimateClaudeRequestInputTokens(effectiveReq)
 	}
 	if estimatedTokens < 1 {
@@ -898,13 +898,21 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Gate on the converted payload (the exact upstream body) so PDF inlining,
 	// system priming and tool dedup are reflected in the estimate.
 	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(kiroPayload)
-	clientInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	clientInputTokens, ok := estimateClaudeRequestRawTikTokenInputTokens(effectiveReq)
 	if !ok {
 		logger.Warnf("[ClaudeContextGate] kiro-gateway request usage estimate unavailable; falling back to approximate token estimator")
 		clientInputTokens = estimateClaudeRequestInputTokens(effectiveReq)
 	}
 	if clientInputTokens < 1 {
 		clientInputTokens = 1
+	}
+	billingInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(effectiveReq)
+	if !ok {
+		logger.Warnf("[ClaudeContextGate] kiro-gateway billing estimate unavailable; falling back to approximate token estimator")
+		billingInputTokens = estimateClaudeRequestInputTokens(effectiveReq)
+	}
+	if billingInputTokens < 1 {
+		billingInputTokens = 1
 	}
 	current := kiroPayload.ConversationState.CurrentMessage.UserInputMessage
 	currentTools := 0
@@ -924,16 +932,26 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	if cacheProfile == nil {
+		logger.Debugf("[ClaudeUsage] cache_profile model=%s profile=nil client_input=%d billing_input=%d", req.Model, clientInputTokens, billingInputTokens)
+	} else {
+		lastTokens := 0
+		if len(cacheProfile.Breakpoints) > 0 {
+			lastTokens = cacheProfile.Breakpoints[len(cacheProfile.Breakpoints)-1].CumulativeTokens
+		}
+		logger.Debugf("[ClaudeUsage] cache_profile model=%s total_input=%d billing_input=%d breakpoints=%d last_breakpoint_tokens=%d",
+			req.Model, cacheProfile.TotalInputTokens, billingInputTokens, len(cacheProfile.Breakpoints), lastTokens)
+	}
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -949,7 +967,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := finalizeKiroInputTokens(0, 0, 0, usageReportWindow, estimatedInputTokens, model)
+	startInputTokens := finalizeClaudeUsageInputTokens(0, 0, 0, usageReportWindow, estimatedInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -986,7 +1004,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheNamespace := account.ID
+		cacheUsage := h.promptCache.Compute(cacheNamespace, cacheProfile)
+		logger.Debugf("[ClaudeUsage] stream namespace=%q account=%s cache_usage={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
+			cacheNamespace, account.ID, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCoveredEstimate, cacheUsage.PromptTotalEstimate)
 		messageStartUsage = cacheUsage
 
 		var inputTokens, outputTokens int
@@ -1354,12 +1375,17 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		} else if emittedOnlyThinking {
 			outputTokens += estimateApproxTokens(" ")
 		}
-		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		upstreamInputTokens := inputTokens
+		publicInputTokens := finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		inputTokens = finalizeKiroInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, billingInputTokens, model)
+		visibleInputTokens, publicCacheUsage := claudeUsageBreakdown(publicInputTokens, cacheUsage, cacheProfile != nil)
+		logger.Debugf("[ClaudeUsage] stream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
+			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
@@ -1375,7 +1401,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(publicInputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1547,7 +1573,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1563,7 +1589,10 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheNamespace := account.ID
+		cacheUsage := h.promptCache.Compute(cacheNamespace, cacheProfile)
+		logger.Debugf("[ClaudeUsage] nonstream namespace=%q account=%s cache_usage={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
+			cacheNamespace, account.ID, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCoveredEstimate, cacheUsage.PromptTotalEstimate)
 
 		var content string
 		var thinkingContent string
@@ -1623,12 +1652,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		} else if emittedOnlyThinking {
 			outputTokens += estimateApproxTokens(" ")
 		}
-		inputTokens = finalizeKiroInputTokens(inputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		upstreamInputTokens := inputTokens
+		publicInputTokens := finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		inputTokens = finalizeKiroInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, billingInputTokens, model)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
@@ -1649,17 +1680,20 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, publicInputTokens, outputTokens, model)
 		if emittedOnlyThinking {
 			resp.StopReason = "max_tokens"
 		}
-		resp.Usage.InputTokens = inputTokens
-		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
-		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+		visibleInputTokens, publicCacheUsage := claudeUsageBreakdown(publicInputTokens, cacheUsage, cacheProfile != nil)
+		logger.Debugf("[ClaudeUsage] nonstream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
+			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
+		resp.Usage.InputTokens = visibleInputTokens
+		resp.Usage.CacheCreationInputTokens = publicCacheUsage.CacheCreationInputTokens
+		resp.Usage.CacheReadInputTokens = publicCacheUsage.CacheReadInputTokens
 		if cacheProfile != nil {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
-				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
-				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+				Ephemeral5mInputTokens: publicCacheUsage.CacheCreation5mInputTokens,
+				Ephemeral1hInputTokens: publicCacheUsage.CacheCreation1hInputTokens,
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

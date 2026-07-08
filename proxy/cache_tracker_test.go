@@ -56,14 +56,17 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 
 	m := buildClaudeUsageMap(100, 50, usage, true)
 
-	if got := m["input_tokens"]; got != 100 {
-		t.Fatalf("expected displayed input tokens 100, got %#v", got)
+	if got := m["input_tokens"]; got != 50 {
+		t.Fatalf("expected displayed uncached input tokens 50, got %#v", got)
 	}
 	if got := m["cache_creation_input_tokens"]; got != 30 {
 		t.Fatalf("expected cache creation tokens 30, got %#v", got)
 	}
 	if got := m["cache_read_input_tokens"]; got != 20 {
 		t.Fatalf("expected cache read tokens 20, got %#v", got)
+	}
+	if m["input_tokens"].(int)+m["cache_creation_input_tokens"].(int)+m["cache_read_input_tokens"].(int) != 100 {
+		t.Fatalf("expected usage fields to reconstruct total input 100, got %#v", m)
 	}
 	creation, ok := m["cache_creation"].(map[string]int)
 	if !ok {
@@ -260,5 +263,100 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	result := tracker.Compute("acct-1", profile2)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
+	}
+}
+
+func TestPromptCacheSkipsDynamicSystemPreludeBeforeFirstExplicitCacheBlock(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	stableSystem := strings.Repeat("stable cacheable instructions ", 320)
+
+	build := func(dynamic string) *ClaudeRequest {
+		return &ClaudeRequest{
+			Model: "claude-sonnet-4.5",
+			System: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": dynamic,
+				},
+				map[string]interface{}{
+					"type": "text",
+					"text": stableSystem,
+					"cache_control": map[string]interface{}{
+						"type": "ephemeral",
+					},
+				},
+			},
+			Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
+		}
+	}
+
+	req1 := build("current time: 2026-07-07T11:00:00Z")
+	profile1 := tracker.BuildClaudeProfile(req1, 2048)
+	if profile1 == nil {
+		t.Fatalf("expected profile1 to be built")
+	}
+	tracker.Update("acct-1", profile1)
+
+	req2 := build("current time: 2026-07-07T11:05:00Z")
+	profile2 := tracker.BuildClaudeProfile(req2, 2048)
+	if profile2 == nil {
+		t.Fatalf("expected profile2 to be built")
+	}
+	result := tracker.Compute("acct-1", profile2)
+	if result.CacheReadInputTokens == 0 {
+		t.Fatalf("expected stable suffix to hit cache despite dynamic prelude drift, got %+v", result)
+	}
+}
+
+func TestPromptCacheHitDoesNotExtendExpiry(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("stable cacheable instructions ", 320)
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": longSystem,
+				"cache_control": map[string]interface{}{
+					"type": "ephemeral",
+				},
+			},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello world"}},
+	}
+
+	profile := tracker.BuildClaudeProfile(req, 2048)
+	if profile == nil {
+		t.Fatalf("expected profile to be built")
+	}
+	tracker.Update("acct-1", profile)
+
+	tracker.mu.Lock()
+	for fp, entry := range tracker.entriesByAccount["acct-1"] {
+		entry.ExpiresAt = time.Now().Add(50 * time.Millisecond)
+		tracker.entriesByAccount["acct-1"][fp] = entry
+	}
+	var before time.Time
+	for _, entry := range tracker.entriesByAccount["acct-1"] {
+		before = entry.ExpiresAt
+		break
+	}
+	tracker.mu.Unlock()
+
+	result := tracker.Compute("acct-1", profile)
+	if result.CacheReadInputTokens == 0 {
+		t.Fatalf("expected warmed cache hit, got %+v", result)
+	}
+
+	tracker.mu.Lock()
+	var after time.Time
+	for _, entry := range tracker.entriesByAccount["acct-1"] {
+		after = entry.ExpiresAt
+		break
+	}
+	tracker.mu.Unlock()
+
+	if after.UnixNano() != before.UnixNano() {
+		t.Fatalf("expected cache hit to keep original expiry, before=%s after=%s", before, after)
 	}
 }

@@ -349,6 +349,18 @@ func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsage
 	return capInputTokensToContextWindow(inputTokens, model)
 }
 
+func finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
+	inputTokens := 0
+	if contextUsagePercentage > 0 {
+		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+	} else if upstreamInputTokens > 0 {
+		inputTokens = upstreamInputTokens
+	} else if estimatedInputTokens > 0 {
+		inputTokens = estimatedInputTokens
+	}
+	return capInputTokensToContextWindow(inputTokens, model)
+}
+
 func finalizeKiroReportedInputTokens(inputTokens int, model string) int {
 	return capInputTokensToContextWindow(inputTokens, model)
 }

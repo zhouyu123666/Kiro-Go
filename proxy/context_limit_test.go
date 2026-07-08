@@ -125,15 +125,26 @@ func TestClaudeMessagesRejectsOverKiroInputTokenLimit(t *testing.T) {
 func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing.T) {
 	const model = "claude-sonnet-4.5"
 	compactionLimit := modelClientCompactionLimit(model)
-	repeatCount := compactionLimit*100/115 + 1_000
-	content := strings.Repeat("context ", repeatCount)
-	claudeReq := ClaudeRequest{
-		Model: model,
-		Messages: []ClaudeMessage{
-			{Role: "user", Content: content},
-		},
+	repeatCount := compactionLimit
+	var claudeReq ClaudeRequest
+	var gatewayEstimated int
+	for {
+		content := strings.Repeat("context ", repeatCount)
+		claudeReq = ClaudeRequest{
+			Model: model,
+			Messages: []ClaudeMessage{
+				{Role: "user", Content: content},
+			},
+		}
+		gatewayEstimated = estimateClaudeCompactionInputTokens(&claudeReq)
+		if gatewayEstimated > compactionLimit {
+			break
+		}
+		repeatCount += 1_000
+		if repeatCount > compactionLimit*4 {
+			t.Fatalf("test setup could not exceed compaction limit %d, last estimate %d", compactionLimit, gatewayEstimated)
+		}
 	}
-	gatewayEstimated := estimateClaudeCompactionInputTokens(&claudeReq)
 	if gatewayEstimated <= compactionLimit {
 		t.Fatalf("test setup expected gateway estimate above %d, got %d",
 			compactionLimit, gatewayEstimated)
@@ -156,7 +167,7 @@ func TestClaudeMessagesOverGatewayCompactionLimitReturnsPromptTooLong(t *testing
 	assertPromptTooLongError(t, rr, gatewayEstimated, model)
 }
 
-func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
+func TestClaudeCountTokensUsesPublicEstimate(t *testing.T) {
 	claudeReq := ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -181,9 +192,15 @@ func TestClaudeCountTokensUsesGatewayEstimate(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	want := estimateClaudeCompactionInputTokens(&claudeReq)
+	want, ok := estimateClaudeRequestRawTikTokenInputTokens(&claudeReq)
+	if !ok {
+		want = estimateClaudeRequestInputTokens(&claudeReq)
+	}
 	if got["input_tokens"] != want {
-		t.Fatalf("count_tokens input_tokens=%d, want gateway estimate %d", got["input_tokens"], want)
+		t.Fatalf("count_tokens input_tokens=%d, want public estimate %d", got["input_tokens"], want)
+	}
+	if gateway := estimateClaudeCompactionInputTokens(&claudeReq); got["input_tokens"] >= gateway {
+		t.Fatalf("count_tokens should not expose gateway safety estimate: got %d gateway %d", got["input_tokens"], gateway)
 	}
 }
 

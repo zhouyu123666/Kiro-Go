@@ -160,9 +160,14 @@ type ClaudeRequest struct {
 	TopP        float64               `json:"top_p,omitempty"`
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Metadata    *ClaudeMetadata       `json:"metadata,omitempty"`
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+}
+
+type ClaudeMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
