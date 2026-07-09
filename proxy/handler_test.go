@@ -115,11 +115,35 @@ func TestRecordSuccessLogStoresTokenBreakdown(t *testing.T) {
 	}
 
 	got := logs[0]
-	if got.Tokens != 105 || got.InputTokens != 20 || got.CacheTokens != 70 || got.OutputTokens != 15 || got.BillableInputTokens != 90 {
+	if got.Tokens != 105 || got.InputTokens != 90 || got.CacheTokens != 70 || got.OutputTokens != 15 || got.BillableInputTokens != 90 {
 		t.Fatalf("unexpected token breakdown: %+v", got)
 	}
 	if got.CacheCreationInputTokens != 30 || got.CacheReadInputTokens != 40 {
 		t.Fatalf("unexpected cache token breakdown: %+v", got)
+	}
+}
+
+func TestRecordSuccessLogUsesBillableInputForDisplayedBreakdown(t *testing.T) {
+	h := &Handler{}
+
+	h.recordSuccessLog("claude", "claude-sonnet-5", "acct-1", requestLogTokenUsage{
+		TotalTokens:         85,
+		InputTokens:         6700,
+		OutputTokens:        69,
+		BillableInputTokens: 16,
+	}, 0.12, 12110)
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logs))
+	}
+
+	got := logs[0]
+	if got.Tokens != 85 || got.InputTokens != 16 || got.OutputTokens != 69 {
+		t.Fatalf("expected displayed tokens to use billable total/input/output, got %+v", got)
+	}
+	if got.BillableInputTokens != 16 {
+		t.Fatalf("expected billable input to remain available separately, got %+v", got)
 	}
 }
 

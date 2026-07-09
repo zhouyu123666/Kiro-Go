@@ -65,7 +65,9 @@ Kiro-Go 会基于以下内容构建 cache profile：
 - Anthropic billing header block 不参与 cache fingerprint
 - cache hit 不会续 TTL
 - 只有请求成功完成后才会 Update 本地 cache
-- 最后一个 block 永远不会成为缓存断点（无论显式还是隐式 cache_control）
+- 最后一个 block 不作为“本轮 cache creation/coverage 上限”（无论显式还是
+  隐式 cache_control）；如果已有完全相同 fingerprint，则可以作为真实
+  cache read 命中；请求成功后仍会写入本地 tracker，供下一轮命中
 
 关于“最后一个 block 不做断点”：
 
@@ -79,9 +81,13 @@ cache_control，用来给“下一轮”预热缓存。但对“本轮”来说�
 - 于是 cache_covered_est ≈ prompt_total_est，coverage_ratio ≈ 1.0
 - 可见的未缓存 input_tokens 几乎每次都会塌到 envelope floor（6）
 
-因此本轮不把最后一个 block 当断点，新增的尾巴才会作为真实未缓存输入体现。
-它会在下一轮、当有更新的 message 追加到它后面、不再是最后一个 block 时，
-自然变为可缓存前缀。
+因此本轮不把未命中的最后一个 block 当作 usage coverage 上限，新增的尾巴才会
+作为真实未缓存输入体现。若完全相同的最后 block 已在本地 tracker 中存在，则
+可以作为真实 cache read 计入。
+
+同时，成功完成请求后仍会把这个最后 block 的 fingerprint 写入本地 tracker。
+这样它在下一轮、当有更新的 message 追加到它后面时，可以作为已缓存前缀被
+读到；只是不会把新的尾巴污染进“本轮”的可见 input_tokens。
 
 6. 模型最小可缓存阈值
 
@@ -201,9 +207,11 @@ public total input）才会触发。此时 Kiro-Go 不会把 usage.input_tokens 
 input_tokens 都塌到 6。这不是真实缓存率，而是把“本轮新增的尾巴”错误地
 算成了已缓存内容。
 
-修复方式见第 5 节：最后一个 block 永远不做缓存断点。修复后，只有当缓存
-真的吃掉了几乎全部输入（例如完全重复的请求）时才会命中 floor；常规带新
-问题的多轮请求，尾巴会作为真实未缓存 input_tokens 体现，远高于 6。
+修复方式见第 5 节：最后一个 block 不作为本轮 cache creation/coverage 上限，
+但如果已经存在完全相同 fingerprint，则可以作为真实 cache read；请求成功后也
+仍会写入本地 tracker。修复后，只有当缓存真的吃掉了几乎全部输入（例如完全
+重复的请求）时才会命中 floor；常规带新问题的多轮请求，尾巴会作为真实未缓存
+input_tokens 体现，远高于 6。
 
 9. 典型行为预期
 

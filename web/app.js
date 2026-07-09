@@ -719,13 +719,14 @@
 
   function formatLogTokens(l) {
     const total = Number(l.tokens || 0);
-    const input = Number(l.inputTokens || 0);
+    const rawInput = Number(l.inputTokens || 0);
     const cacheCreate = Number(l.cacheCreationInputTokens || 0);
     const cacheRead = Number(l.cacheReadInputTokens || 0);
     const cache = Number(l.cacheTokens || 0) || cacheCreate + cacheRead;
     const output = Number(l.outputTokens || 0);
     const billableInput = Number(l.billableInputTokens || 0);
-    const hasBreakdown = input > 0 || cache > 0 || output > 0 || billableInput > 0;
+    const input = billableInput > 0 ? billableInput : rawInput;
+    const hasBreakdown = input > 0 || cache > 0 || output > 0;
 
     if (!total && !hasBreakdown) return '-';
     if (!hasBreakdown) return escapeHtml(formatNum(total));
@@ -737,12 +738,8 @@
       t('logs.cacheReadTokens') + ': ' + formatNum(cacheRead),
       t('logs.outputTokens') + ': ' + formatNum(output)
     ];
-    if (billableInput > 0) {
-      titleParts.push(t('logs.billableInputTokens') + ': ' + formatNum(billableInput));
-    }
-
     return '<div class="log-token-cell" title="' + escapeAttr(titleParts.join(' | ')) + '">' +
-      '<div class="log-token-total">' + escapeHtml(total ? formatNum(total) : formatNum(input + cache + output)) + '</div>' +
+      '<div class="log-token-total">' + escapeHtml(formatNum(total ? total : input + cache + output)) + '</div>' +
       '<div class="log-token-parts">' +
         '<span>' + escapeHtml(t('logs.inputTokens')) + ' ' + escapeHtml(formatNum(input)) + '</span>' +
         '<span>' + escapeHtml(t('logs.cacheTokens')) + ' ' + escapeHtml(formatNum(cache)) + '</span>' +

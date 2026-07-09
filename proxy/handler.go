@@ -29,7 +29,7 @@ type RequestLog struct {
 	Error                    string  `json:"error"`                              // Error message (empty on success)
 	ErrorType                string  `json:"errorType"`                          // Error category (empty on success)
 	Tokens                   int     `json:"tokens"`                             // Existing billable total token counter
-	InputTokens              int     `json:"inputTokens,omitempty"`              // Visible uncached input tokens
+	InputTokens              int     `json:"inputTokens,omitempty"`              // Input token counter shown in request logs
 	CacheTokens              int     `json:"cacheTokens,omitempty"`              // Cache creation + cache read tokens
 	CacheCreationInputTokens int     `json:"cacheCreationInputTokens,omitempty"` // Cache write tokens
 	CacheReadInputTokens     int     `json:"cacheReadInputTokens,omitempty"`     // Cache read tokens
@@ -954,8 +954,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		if len(cacheProfile.Breakpoints) > 0 {
 			lastTokens = cacheProfile.Breakpoints[len(cacheProfile.Breakpoints)-1].CumulativeTokens
 		}
-		logger.Debugf("[ClaudeUsage] cache_profile model=%s total_input=%d billing_input=%d breakpoints=%d last_breakpoint_tokens=%d",
-			req.Model, cacheProfile.TotalInputTokens, billingInputTokens, len(cacheProfile.Breakpoints), lastTokens)
+		lastStorageTokens := 0
+		if len(cacheProfile.StorageBreakpoints) > 0 {
+			lastStorageTokens = cacheProfile.StorageBreakpoints[len(cacheProfile.StorageBreakpoints)-1].CumulativeTokens
+		}
+		logger.Debugf("[ClaudeUsage] cache_profile model=%s total_input=%d billing_input=%d breakpoints=%d last_breakpoint_tokens=%d storage_breakpoints=%d last_storage_tokens=%d",
+			req.Model, cacheProfile.TotalInputTokens, billingInputTokens, len(cacheProfile.Breakpoints), lastTokens, len(cacheProfile.StorageBreakpoints), lastStorageTokens)
 	}
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
@@ -1537,9 +1541,13 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 // recordSuccessLog records a successful request in the request logs.
 func (h *Handler) recordSuccessLog(endpoint, model, accountID string, usage requestLogTokenUsage, credits float64, durationMs int64) {
 	cacheTokens := usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+	displayInputTokens := usage.InputTokens
+	if usage.BillableInputTokens > 0 {
+		displayInputTokens = usage.BillableInputTokens
+	}
 	totalTokens := usage.TotalTokens
 	if totalTokens <= 0 {
-		totalTokens = usage.BillableInputTokens + usage.OutputTokens
+		totalTokens = displayInputTokens + usage.OutputTokens
 	}
 	if totalTokens <= 0 {
 		totalTokens = usage.InputTokens + cacheTokens + usage.OutputTokens
@@ -1551,7 +1559,7 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, usage requ
 		AccountID:                accountID,
 		Status:                   "success",
 		Tokens:                   totalTokens,
-		InputTokens:              usage.InputTokens,
+		InputTokens:              displayInputTokens,
 		CacheTokens:              cacheTokens,
 		CacheCreationInputTokens: usage.CacheCreationInputTokens,
 		CacheReadInputTokens:     usage.CacheReadInputTokens,

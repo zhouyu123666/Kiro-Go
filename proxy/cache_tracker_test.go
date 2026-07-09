@@ -418,6 +418,66 @@ func TestPromptCacheExplicitCacheControlOnTailStaysVisible(t *testing.T) {
 	}
 }
 
+func TestPromptCacheFinalBlockStoredForNextTurn(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go. ", 120)
+	firstQuestion := strings.Repeat("first question with enough stable detail. ", 40)
+	baseSystem := []interface{}{
+		map[string]interface{}{
+			"type": "text",
+			"text": systemText,
+			"cache_control": map[string]interface{}{
+				"type": "ephemeral",
+			},
+		},
+	}
+
+	req1 := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   baseSystem,
+		Messages: []ClaudeMessage{{Role: "user", Content: firstQuestion}},
+	}
+	profile1 := tracker.BuildClaudeProfile(req1, 4096)
+	if profile1 == nil {
+		t.Fatalf("profile1 should be built")
+	}
+	if len(profile1.Breakpoints) == 0 || len(profile1.StorageBreakpoints) <= len(profile1.Breakpoints) {
+		t.Fatalf("expected final block to be stored separately from usage breakpoints: %+v", profile1)
+	}
+	lastUsageTokens := profile1.Breakpoints[len(profile1.Breakpoints)-1].CumulativeTokens
+	finalStoredTokens := profile1.StorageBreakpoints[len(profile1.StorageBreakpoints)-1].CumulativeTokens
+	if finalStoredTokens <= lastUsageTokens {
+		t.Fatalf("expected final stored breakpoint %d to extend beyond usage breakpoint %d", finalStoredTokens, lastUsageTokens)
+	}
+	tracker.Update("acct-1", profile1)
+
+	repeated := tracker.Compute("acct-1", profile1)
+	if repeated.CacheReadInputTokens <= lastUsageTokens {
+		t.Fatalf("expected repeated request to read the stored final block, got usage=%+v last_usage_tokens=%d", repeated, lastUsageTokens)
+	}
+
+	req2 := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: baseSystem,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: firstQuestion},
+			{Role: "assistant", Content: "the first answer"},
+			{Role: "user", Content: strings.Repeat("fresh second question. ", 40)},
+		},
+	}
+	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	if profile2 == nil {
+		t.Fatalf("profile2 should be built")
+	}
+	usage := tracker.Compute("acct-1", profile2)
+	if usage.CacheReadInputTokens <= lastUsageTokens {
+		t.Fatalf("expected next turn to read through prior final block, got usage=%+v last_usage_tokens=%d", usage, lastUsageTokens)
+	}
+	if usage.CacheCoveredEstimate >= profile2.TotalInputTokens {
+		t.Fatalf("expected current final block to stay out of current-turn coverage, got usage=%+v total=%d", usage, profile2.TotalInputTokens)
+	}
+}
+
 func TestPromptCacheSkipsDynamicSystemPreludeBeforeFirstExplicitCacheBlock(t *testing.T) {
 	tracker := newPromptCacheTracker(time.Hour)
 	stableSystem := strings.Repeat("stable cacheable instructions ", 320)

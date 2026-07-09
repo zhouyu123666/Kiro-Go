@@ -38,9 +38,10 @@ type promptCacheBreakpoint struct {
 }
 
 type promptCacheProfile struct {
-	Breakpoints      []promptCacheBreakpoint
-	TotalInputTokens int
-	Model            string
+	Breakpoints        []promptCacheBreakpoint
+	StorageBreakpoints []promptCacheBreakpoint
+	TotalInputTokens   int
+	Model              string
 }
 
 func minCacheableTokensForModel(model string) int {
@@ -80,6 +81,7 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 
 	hasher := sha256.New()
 	breakpoints := make([]promptCacheBreakpoint, 0)
+	storageBreakpoints := make([]promptCacheBreakpoint, 0)
 	cumulativeTokens := 0
 	var activeTTL time.Duration
 
@@ -97,26 +99,6 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 			activeTTL = block.TTL
 		}
 
-		// The final block is NEVER turned into a cache breakpoint, whether its
-		// cache_control is explicit or implicit.
-		//
-		// Claude Code marks the newest message (the last block) with
-		// cache_control to prime the cache for the *next* turn, and it also
-		// places cache_control on system/tools which makes every later
-		// message-end an implicit breakpoint. Either way, if the last block
-		// becomes a breakpoint its cumulative token count equals the full
-		// prompt total, so CacheCoveredEstimate == PromptTotalEstimate, the
-		// coverage ratio approaches 1.0, and the visible uncached input_tokens
-		// collapses to the envelope floor (6) on essentially every request.
-		//
-		// On *this* turn the last block is brand-new content that could not
-		// have been cached before, so excluding it keeps the fresh tail as
-		// genuine uncached input. It still becomes cacheable one turn later,
-		// once a newer message follows it and it is no longer the final block.
-		if blockIndex == lastBlockIndex {
-			continue
-		}
-
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			breakpointTTL = block.TTL
@@ -130,15 +112,36 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 
 		var fingerprint [32]byte
 		copy(fingerprint[:], hasher.Sum(nil))
-		breakpoints = append(breakpoints, promptCacheBreakpoint{
+		breakpoint := promptCacheBreakpoint{
 			Fingerprint:      fingerprint,
 			CumulativeTokens: cumulativeTokens,
 			TTL:              breakpointTTL,
-		})
+		}
+		storageBreakpoints = append(storageBreakpoints, breakpoint)
+
+		// The final block is not added to current-turn cache-creation coverage
+		// breakpoints, whether its cache_control is explicit or implicit.
+		//
+		// Claude Code marks the newest message (the last block) with
+		// cache_control to prime the cache for the *next* turn, and it also
+		// places cache_control on system/tools which makes every later
+		// message-end an implicit breakpoint. Either way, if the last block
+		// contributes to current-turn coverage its cumulative token count equals
+		// the full prompt total, so CacheCoveredEstimate == PromptTotalEstimate,
+		// the coverage ratio approaches 1.0, and the visible uncached
+		// input_tokens collapses to the envelope floor (6).
+		//
+		// Still keep it in storage breakpoints so Compute can count an exact
+		// prior match as a real cache read, and Update can warm it for the next
+		// turn once a newer message follows it.
+		if blockIndex == lastBlockIndex {
+			continue
+		}
+		breakpoints = append(breakpoints, breakpoint)
 	}
 
-	if len(breakpoints) == 0 {
-		logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=0", req.Model, totalInputTokens)
+	if len(breakpoints) == 0 && len(storageBreakpoints) == 0 {
+		logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=0 storage_breakpoints=0", req.Model, totalInputTokens)
 		return nil
 	}
 
@@ -147,33 +150,46 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 
 	profile := &promptCacheProfile{
-		Breakpoints:      breakpoints,
-		TotalInputTokens: totalInputTokens,
-		Model:            req.Model,
+		Breakpoints:        breakpoints,
+		StorageBreakpoints: storageBreakpoints,
+		TotalInputTokens:   totalInputTokens,
+		Model:              req.Model,
 	}
 	lastTokens := 0
 	if len(profile.Breakpoints) > 0 {
 		lastTokens = profile.Breakpoints[len(profile.Breakpoints)-1].CumulativeTokens
 	}
-	logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=%d last_breakpoint_tokens=%d",
-		req.Model, totalInputTokens, len(profile.Breakpoints), lastTokens)
+	lastStorageTokens := 0
+	if len(profile.StorageBreakpoints) > 0 {
+		lastStorageTokens = profile.StorageBreakpoints[len(profile.StorageBreakpoints)-1].CumulativeTokens
+	}
+	logger.Debugf("[PromptCache] build_profile model=%s total_input=%d breakpoints=%d last_breakpoint_tokens=%d storage_breakpoints=%d last_storage_tokens=%d",
+		req.Model, totalInputTokens, len(profile.Breakpoints), lastTokens, len(profile.StorageBreakpoints), lastStorageTokens)
 	return profile
 }
 
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
-	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
-		logger.Debugf("[PromptCache] compute namespace=%q skipped profile_nil=%t breakpoints=%d", accountID, profile == nil, func() int {
+	if t == nil || profile == nil || len(profile.StorageBreakpoints) == 0 || accountID == "" {
+		logger.Debugf("[PromptCache] compute namespace=%q skipped profile_nil=%t breakpoints=%d storage_breakpoints=%d", accountID, profile == nil, func() int {
 			if profile == nil {
 				return 0
 			}
 			return len(profile.Breakpoints)
+		}(), func() int {
+			if profile == nil {
+				return 0
+			}
+			return len(profile.StorageBreakpoints)
 		}())
 		return promptCacheUsage{}
 	}
 
 	minTokens := minCacheableTokensForModel(profile.Model)
-	last := profile.Breakpoints[len(profile.Breakpoints)-1]
-	lastTokens := minInt(last.CumulativeTokens, profile.TotalInputTokens)
+	lastTokens := 0
+	if len(profile.Breakpoints) > 0 {
+		last := profile.Breakpoints[len(profile.Breakpoints)-1]
+		lastTokens = minInt(last.CumulativeTokens, profile.TotalInputTokens)
+	}
 	now := time.Now()
 
 	t.mu.Lock()
@@ -202,8 +218,8 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 	}
 
 	matchedTokens := 0
-	for i := len(profile.Breakpoints) - 1; i >= 0; i-- {
-		breakpoint := profile.Breakpoints[i]
+	for i := len(profile.StorageBreakpoints) - 1; i >= 0; i-- {
+		breakpoint := profile.StorageBreakpoints[i]
 		// Skip breakpoints below the minimum cacheable token threshold.
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
@@ -213,29 +229,27 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 			continue
 		}
 		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
-		if matchedTokens > lastTokens {
-			matchedTokens = lastTokens
-		}
 		break
 	}
 
 	creation := maxInt(lastTokens-matchedTokens, 0)
+	coveredEstimate := maxInt(lastTokens, matchedTokens)
 	cache5m, cache1h := computePromptCacheTTLBreakdown(profile, matchedTokens)
 	usage := promptCacheUsage{
 		CacheCreationInputTokens:   creation,
 		CacheReadInputTokens:       matchedTokens,
 		CacheCreation5mInputTokens: cache5m,
 		CacheCreation1hInputTokens: cache1h,
-		CacheCoveredEstimate:       lastTokens,
+		CacheCoveredEstimate:       coveredEstimate,
 		PromptTotalEstimate:        profile.TotalInputTokens,
 	}
-	logger.Debugf("[PromptCache] compute namespace=%q entries=%d total_input=%d min_tokens=%d last_tokens=%d matched_tokens=%d result={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
-		accountID, len(entries), profile.TotalInputTokens, minTokens, lastTokens, matchedTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens, usage.CacheCoveredEstimate, usage.PromptTotalEstimate)
+	logger.Debugf("[PromptCache] compute namespace=%q entries=%d total_input=%d min_tokens=%d last_tokens=%d matched_tokens=%d breakpoints=%d storage_breakpoints=%d result={creation:%d read:%d covered_est:%d prompt_total_est:%d}",
+		accountID, len(entries), profile.TotalInputTokens, minTokens, lastTokens, matchedTokens, len(profile.Breakpoints), len(profile.StorageBreakpoints), usage.CacheCreationInputTokens, usage.CacheReadInputTokens, usage.CacheCoveredEstimate, usage.PromptTotalEstimate)
 	return usage
 }
 
 func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfile) {
-	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
+	if t == nil || profile == nil || len(profile.StorageBreakpoints) == 0 || accountID == "" {
 		return
 	}
 
@@ -251,7 +265,7 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 		t.entriesByAccount[accountID] = entries
 	}
 
-	for _, breakpoint := range profile.Breakpoints {
+	for _, breakpoint := range profile.StorageBreakpoints {
 		// Skip breakpoints below the minimum cacheable token threshold.
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
