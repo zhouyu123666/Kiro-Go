@@ -266,6 +266,76 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	}
 }
 
+// TestPromptCacheTailMessageStaysVisible reproduces the "every request shows
+// input_tokens=6" bug: Claude Code puts cache_control on system/tools, which
+// turned every later message-end (including the brand-new user message) into an
+// implicit breakpoint, so the fresh tail was absorbed into the cacheable prefix
+// and visible uncached input collapsed to the envelope floor. After the fix the
+// new tail must remain visible as genuine uncached input_tokens.
+func TestPromptCacheTailMessageStaysVisible(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	systemText := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go. ", 120)
+	baseSystem := []interface{}{
+		map[string]interface{}{
+			"type": "text",
+			"text": systemText,
+			"cache_control": map[string]interface{}{
+				"type": "ephemeral",
+			},
+		},
+	}
+
+	// Round 1: prime the cache with the stable system prefix.
+	req1 := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   baseSystem,
+		Messages: []ClaudeMessage{{Role: "user", Content: "first question"}},
+	}
+	profile1 := tracker.BuildClaudeProfile(req1, 4096)
+	if profile1 == nil {
+		t.Fatalf("profile1 should be built")
+	}
+	tracker.Update("acct-1", profile1)
+
+	// Round 2: same cached prefix plus a substantial NEW user question.
+	newQuestion := strings.Repeat("please explain this fresh follow-up in detail. ", 40)
+	req2 := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: baseSystem,
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "first question"},
+			{Role: "assistant", Content: "the first answer"},
+			{Role: "user", Content: newQuestion},
+		},
+	}
+	profile2 := tracker.BuildClaudeProfile(req2, 4096)
+	if profile2 == nil {
+		t.Fatalf("profile2 should be built")
+	}
+	usage := tracker.Compute("acct-1", profile2)
+	if usage.CacheReadInputTokens == 0 {
+		t.Fatalf("expected cache read on stable prefix, got %+v", usage)
+	}
+
+	// The new tail must not be swallowed by the cache: visible input has to
+	// exceed the envelope floor of 6.
+	m := buildClaudeUsageMap(profile2.TotalInputTokens, 50, usage, true)
+	visible, ok := m["input_tokens"].(int)
+	if !ok {
+		t.Fatalf("input_tokens missing or wrong type: %v", m["input_tokens"])
+	}
+	if visible <= claudeUsageEnvelopeMinTokens {
+		t.Fatalf("expected visible input above envelope floor %d, got %d (tail absorbed into cache)", claudeUsageEnvelopeMinTokens, visible)
+	}
+
+	// Sanity: the public accounting identity still holds.
+	created, _ := m["cache_creation_input_tokens"].(int)
+	read, _ := m["cache_read_input_tokens"].(int)
+	if visible+created+read != profile2.TotalInputTokens {
+		t.Fatalf("usage identity broken: %d + %d + %d != %d", visible, created, read, profile2.TotalInputTokens)
+	}
+}
+
 func TestPromptCacheSkipsDynamicSystemPreludeBeforeFirstExplicitCacheBlock(t *testing.T) {
 	tracker := newPromptCacheTracker(time.Hour)
 	stableSystem := strings.Repeat("stable cacheable instructions ", 320)

@@ -83,7 +83,8 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	cumulativeTokens := 0
 	var activeTTL time.Duration
 
-	for _, block := range blocks {
+	lastBlockIndex := len(blocks) - 1
+	for blockIndex, block := range blocks {
 		canonical := canonicalizeCacheValue(block.Value)
 		writeHashChunk(hasher, canonical)
 		cumulativeTokens += block.Tokens
@@ -93,11 +94,21 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		//   2) Once any explicit breakpoint has been seen, every message-end
 		//      boundary becomes an implicit breakpoint so that multi-turn
 		//      conversations can hit earlier stored prefixes.
+		//
+		// Exception: the final block is never turned into an *implicit*
+		// breakpoint. Claude Code places cache_control on system/tools, which
+		// makes every later message-end an implicit breakpoint. Without this
+		// exception the last (new) user message would also become part of the
+		// cacheable prefix, so the freshly added input gets absorbed into
+		// cache_creation and the visible uncached input_tokens collapses to the
+		// envelope floor (6) on every request. Excluding the last block keeps
+		// the tail delta as genuine uncached input. An explicit cache_control
+		// on the last block is still honored.
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			breakpointTTL = block.TTL
 			activeTTL = block.TTL
-		} else if block.IsMessageEnd && activeTTL > 0 {
+		} else if block.IsMessageEnd && activeTTL > 0 && blockIndex != lastBlockIndex {
 			breakpointTTL = activeTTL
 		}
 
