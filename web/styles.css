@@ -1338,6 +1338,26 @@ img.brand-icon {
   white-space: normal;
   word-break: break-all;
 }
+.log-token-cell {
+  min-width: 9rem;
+  line-height: 1.35;
+}
+.log-token-total {
+  color: var(--foreground);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.log-token-parts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.125rem 0.5rem;
+  margin-top: 0.125rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+.log-token-parts span {
+  white-space: nowrap;
+}
 .log-status {
   display: inline-block;
   padding: 0.125rem 0.5rem;

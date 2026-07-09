@@ -97,6 +97,32 @@ func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	}
 }
 
+func TestRecordSuccessLogStoresTokenBreakdown(t *testing.T) {
+	h := &Handler{}
+
+	h.recordSuccessLog("claude", "claude-opus-4.8", "acct-1", requestLogTokenUsage{
+		TotalTokens:              105,
+		InputTokens:              20,
+		CacheCreationInputTokens: 30,
+		CacheReadInputTokens:     40,
+		OutputTokens:             15,
+		BillableInputTokens:      90,
+	}, 0.75, 1234)
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logs))
+	}
+
+	got := logs[0]
+	if got.Tokens != 105 || got.InputTokens != 20 || got.CacheTokens != 70 || got.OutputTokens != 15 || got.BillableInputTokens != 90 {
+		t.Fatalf("unexpected token breakdown: %+v", got)
+	}
+	if got.CacheCreationInputTokens != 30 || got.CacheReadInputTokens != 40 {
+		t.Fatalf("unexpected cache token breakdown: %+v", got)
+	}
+}
+
 func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {

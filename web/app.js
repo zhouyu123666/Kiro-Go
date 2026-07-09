@@ -717,6 +717,40 @@
     }
   }
 
+  function formatLogTokens(l) {
+    const total = Number(l.tokens || 0);
+    const input = Number(l.inputTokens || 0);
+    const cacheCreate = Number(l.cacheCreationInputTokens || 0);
+    const cacheRead = Number(l.cacheReadInputTokens || 0);
+    const cache = Number(l.cacheTokens || 0) || cacheCreate + cacheRead;
+    const output = Number(l.outputTokens || 0);
+    const billableInput = Number(l.billableInputTokens || 0);
+    const hasBreakdown = input > 0 || cache > 0 || output > 0 || billableInput > 0;
+
+    if (!total && !hasBreakdown) return '-';
+    if (!hasBreakdown) return escapeHtml(formatNum(total));
+
+    const titleParts = [
+      t('logs.inputTokens') + ': ' + formatNum(input),
+      t('logs.cacheTokens') + ': ' + formatNum(cache),
+      t('logs.cacheCreationTokens') + ': ' + formatNum(cacheCreate),
+      t('logs.cacheReadTokens') + ': ' + formatNum(cacheRead),
+      t('logs.outputTokens') + ': ' + formatNum(output)
+    ];
+    if (billableInput > 0) {
+      titleParts.push(t('logs.billableInputTokens') + ': ' + formatNum(billableInput));
+    }
+
+    return '<div class="log-token-cell" title="' + escapeAttr(titleParts.join(' | ')) + '">' +
+      '<div class="log-token-total">' + escapeHtml(total ? formatNum(total) : formatNum(input + cache + output)) + '</div>' +
+      '<div class="log-token-parts">' +
+        '<span>' + escapeHtml(t('logs.inputTokens')) + ' ' + escapeHtml(formatNum(input)) + '</span>' +
+        '<span>' + escapeHtml(t('logs.cacheTokens')) + ' ' + escapeHtml(formatNum(cache)) + '</span>' +
+        '<span>' + escapeHtml(t('logs.outputTokens')) + ' ' + escapeHtml(formatNum(output)) + '</span>' +
+      '</div>' +
+    '</div>';
+  }
+
   function renderLogs(logs) {
     logsCache = logs;
     const list = $('logsList');
@@ -766,7 +800,7 @@
         '<td>' + escapeHtml(l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
-        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + formatLogTokens(l) + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';
