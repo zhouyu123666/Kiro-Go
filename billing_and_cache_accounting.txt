@@ -65,6 +65,23 @@ Kiro-Go 会基于以下内容构建 cache profile：
 - Anthropic billing header block 不参与 cache fingerprint
 - cache hit 不会续 TTL
 - 只有请求成功完成后才会 Update 本地 cache
+- 最后一个 block 永远不会成为缓存断点（无论显式还是隐式 cache_control）
+
+关于“最后一个 block 不做断点”：
+
+Claude Code 会在最新一条 message（也就是最后一个 block）上打显式
+cache_control，用来给“下一轮”预热缓存。但对“本轮”来说，这段内容是全新的、
+之前不可能被缓存过的输入。
+
+如果把它算进可缓存前缀：
+
+- 最后一个断点的 cumulative_tokens 会等于整个 prompt total
+- 于是 cache_covered_est ≈ prompt_total_est，coverage_ratio ≈ 1.0
+- 可见的未缓存 input_tokens 几乎每次都会塌到 envelope floor（6）
+
+因此本轮不把最后一个 block 当断点，新增的尾巴才会作为真实未缓存输入体现。
+它会在下一轮、当有更新的 message 追加到它后面、不再是最后一个 block 时，
+自然变为可缓存前缀。
 
 6. 模型最小可缓存阈值
 
@@ -163,20 +180,30 @@ Kiro-Go 先算缓存覆盖比例：
 
 8. Envelope floor / 未缓存保底
 
-如果 cache 覆盖几乎吃掉了整个 public total input，
-Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的未缓存保底值。
+envelope floor 是一个兜底修正，只在极端情况下（缓存确实覆盖了几乎整个
+public total input）才会触发。此时 Kiro-Go 不会把 usage.input_tokens 压到 0，
+而是保留一个很小的未缓存保底值。
 
 当前保底值：
 
   usage.input_tokens >= 6
-
-这是有意为之。
 
 原因：
 
 - 严格按比例拆账时，数学上可能出现 input_tokens = 0
 - 但对客户端和日志解释来说，完全为 0 往往不够直观
 - 因此保留一个很小的 envelope floor，更符合实际观感
+
+重要：正常多轮对话不应频繁触发这个 floor。
+
+之前有一个 bug：Claude Code 在最后一条 message 上打的显式 cache_control
+被当成了本轮的可缓存断点，导致 coverage_ratio ≈ 1.0，几乎每次请求
+input_tokens 都塌到 6。这不是真实缓存率，而是把“本轮新增的尾巴”错误地
+算成了已缓存内容。
+
+修复方式见第 5 节：最后一个 block 永远不做缓存断点。修复后，只有当缓存
+真的吃掉了几乎全部输入（例如完全重复的请求）时才会命中 floor；常规带新
+问题的多轮请求，尾巴会作为真实未缓存 input_tokens 体现，远高于 6。
 
 9. 典型行为预期
 

@@ -89,26 +89,38 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		writeHashChunk(hasher, canonical)
 		cumulativeTokens += block.Tokens
 
-		// Determine whether this block acts as a cache breakpoint:
-		//   1) Explicit cache_control on the block itself.
-		//   2) Once any explicit breakpoint has been seen, every message-end
-		//      boundary becomes an implicit breakpoint so that multi-turn
-		//      conversations can hit earlier stored prefixes.
+		// Track the active TTL from any explicit cache_control marker so that
+		// later message-end boundaries can inherit it as implicit breakpoints.
+		// This must happen even for the final block, otherwise a trailing
+		// explicit marker would be lost for future turns.
+		if block.TTL > 0 {
+			activeTTL = block.TTL
+		}
+
+		// The final block is NEVER turned into a cache breakpoint, whether its
+		// cache_control is explicit or implicit.
 		//
-		// Exception: the final block is never turned into an *implicit*
-		// breakpoint. Claude Code places cache_control on system/tools, which
-		// makes every later message-end an implicit breakpoint. Without this
-		// exception the last (new) user message would also become part of the
-		// cacheable prefix, so the freshly added input gets absorbed into
-		// cache_creation and the visible uncached input_tokens collapses to the
-		// envelope floor (6) on every request. Excluding the last block keeps
-		// the tail delta as genuine uncached input. An explicit cache_control
-		// on the last block is still honored.
+		// Claude Code marks the newest message (the last block) with
+		// cache_control to prime the cache for the *next* turn, and it also
+		// places cache_control on system/tools which makes every later
+		// message-end an implicit breakpoint. Either way, if the last block
+		// becomes a breakpoint its cumulative token count equals the full
+		// prompt total, so CacheCoveredEstimate == PromptTotalEstimate, the
+		// coverage ratio approaches 1.0, and the visible uncached input_tokens
+		// collapses to the envelope floor (6) on essentially every request.
+		//
+		// On *this* turn the last block is brand-new content that could not
+		// have been cached before, so excluding it keeps the fresh tail as
+		// genuine uncached input. It still becomes cacheable one turn later,
+		// once a newer message follows it and it is no longer the final block.
+		if blockIndex == lastBlockIndex {
+			continue
+		}
+
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			breakpointTTL = block.TTL
-			activeTTL = block.TTL
-		} else if block.IsMessageEnd && activeTTL > 0 && blockIndex != lastBlockIndex {
+		} else if block.IsMessageEnd && activeTTL > 0 {
 			breakpointTTL = activeTTL
 		}
 
