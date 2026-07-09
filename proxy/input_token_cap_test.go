@@ -33,17 +33,23 @@ func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamUsage(t *testing.T) {
+// Public usage priority (see billing_and_cache_accounting.txt §3):
+//   1) contextUsagePercentage-derived value
+//   2) upstream inputTokens
+//   3) local request estimate
+// When contextUsage is absent, upstream wins over the local estimate.
+func TestFinalizeClaudeUsageInputTokensPrefersUpstreamOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 0, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over upstream usage, got %d", got)
+	if got != 1234 {
+		t.Fatalf("expected upstream usage 1234 to win over local estimate, got %d", got)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamAndContextUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamAndEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context usage %d to win over upstream and estimate, got %d", want, got)
 	}
 }
 
@@ -55,10 +61,11 @@ func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverContextUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context usage %d to win over local estimate, got %d", want, got)
 	}
 }
 
