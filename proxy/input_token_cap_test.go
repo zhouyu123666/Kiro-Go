@@ -34,9 +34,10 @@ func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 }
 
 // Public usage priority (see billing_and_cache_accounting.txt §3):
-//   1) contextUsagePercentage-derived value
-//   2) upstream inputTokens
-//   3) local request estimate
+//  1. contextUsagePercentage-derived value
+//  2. upstream inputTokens
+//  3. local request estimate
+//
 // When contextUsage is absent, upstream wins over the local estimate.
 func TestFinalizeClaudeUsageInputTokensPrefersUpstreamOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 0, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
@@ -163,6 +164,26 @@ func TestClaudeUsageMapAppliesEnvelopeFloorWhenCacheConsumesAllPublicInput(t *te
 	}
 	if m["input_tokens"].(int)+m["cache_read_input_tokens"].(int)+m["cache_creation_input_tokens"].(int) != 40 {
 		t.Fatalf("expected usage fields to reconstruct total input 40, got %#v", m)
+	}
+}
+
+func TestClaudeBillableUsageMapKeepsInputTokensExact(t *testing.T) {
+	usage := promptCacheUsage{
+		CacheCreationInputTokens:   7533,
+		CacheReadInputTokens:       42686,
+		CacheCreation5mInputTokens: 7533,
+	}
+
+	m := buildClaudeBillableUsageMap(16, 41, usage, true)
+
+	if got := m["input_tokens"]; got != 16 {
+		t.Fatalf("expected billable input tokens 16 to be returned exactly, got %#v", got)
+	}
+	if got := m["output_tokens"]; got != 41 {
+		t.Fatalf("expected output tokens 41, got %#v", got)
+	}
+	if got := m["cache_read_input_tokens"]; got != 42686 {
+		t.Fatalf("expected cache read tokens to remain available, got %#v", got)
 	}
 }
 

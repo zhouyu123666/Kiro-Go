@@ -10,20 +10,27 @@ Kiro-Go 计费与缓存计量说明
 
 2. 输入 token 口径
 
-当前对客户端返回的 usage.input_tokens 是“公开口径”的未缓存输入。
+当前对客户端返回的 usage.input_tokens 以及请求日志里展示的 Input，使用
+Kiro-Go 本地计费输入口径：
 
-它不是：
+- 优先使用上游 usage / metering 里的 inputTokens
+- 上游未返回 inputTokens 时，使用本地 billing estimate 兜底
+- 不再使用 contextUsagePercentage 推导出的 public total input 作为展示值
 
-- 纯本地估算值
-- 也不是上游真实内部 billable 值
-- 更不是“完整输入 total”原样透传
+因此如果上游返回：
 
-它是 public_total_input 在拆出 cache_read / cache_creation 之后剩余的可见未缓存输入。
+  inputTokens=16, outputTokens=69
 
+则客户端响应和请求日志应显示：
+
+  total=85, input=16, output=69
+
+而不是把 contextUsagePercentage 推导出的几千 token 显示成 input。
 
 3. 对外 public total input 的来源优先级
 
-Claude 兼容接口在生成公开 usage 时，会按下面顺序确定 public total input：
+Claude 兼容接口仍会在内部生成 public total input，用于 prompt cache 的
+cache_read / cache_creation 估算和拆账。这个内部值按下面顺序确定：
 
 1. contextUsagePercentage 推导值
 2. 上游 usage 里的 inputTokens（如果存在）
@@ -174,44 +181,46 @@ Kiro-Go 先算缓存覆盖比例：
   public_cache_creation =
       scaled_cache_total - public_cache_read
 
-最后：
+内部 cache 拆账时：
 
-  visible_input = public_total_input - public_cache_read - public_cache_creation
+  internal_visible_input = public_total_input - public_cache_read - public_cache_creation
 
-如果 visible_input 小于 floor，则会触发第 8 节的未缓存保底修正。
+如果 internal_visible_input 小于 floor，则会触发第 8 节的未缓存保底修正。
 
-最终对外保持以下关系：
+内部 cache 拆账保持以下关系：
 
-  input_tokens + cache_creation_input_tokens + cache_read_input_tokens = public_total_input
+  internal_visible_input + cache_creation_input_tokens + cache_read_input_tokens = public_total_input
+
+注意：客户端响应和请求日志里的 usage.input_tokens / Input 不使用
+internal_visible_input，而使用第 2 节的本地计费输入口径。
 
 8. Envelope floor / 未缓存保底
 
-envelope floor 是一个兜底修正，只在极端情况下（缓存确实覆盖了几乎整个
-public total input）才会触发。此时 Kiro-Go 不会把 usage.input_tokens 压到 0，
-而是保留一个很小的未缓存保底值。
+envelope floor 是内部 cache 拆账的兜底修正，只在极端情况下（缓存确实覆盖了
+几乎整个 public total input）才会触发。此时 Kiro-Go 不会把
+internal_visible_input 压到 0，而是保留一个很小的未缓存保底值。
 
 当前保底值：
 
-  usage.input_tokens >= 6
+  internal_visible_input >= 6
 
 原因：
 
-- 严格按比例拆账时，数学上可能出现 input_tokens = 0
-- 但对客户端和日志解释来说，完全为 0 往往不够直观
+- 严格按比例拆账时，数学上可能出现 internal_visible_input = 0
+- 但对 cache 字段解释来说，完全为 0 往往不够直观
 - 因此保留一个很小的 envelope floor，更符合实际观感
 
 重要：正常多轮对话不应频繁触发这个 floor。
 
 之前有一个 bug：Claude Code 在最后一条 message 上打的显式 cache_control
-被当成了本轮的可缓存断点，导致 coverage_ratio ≈ 1.0，几乎每次请求
-input_tokens 都塌到 6。这不是真实缓存率，而是把“本轮新增的尾巴”错误地
-算成了已缓存内容。
+被当成了本轮的可缓存断点，导致 coverage_ratio ≈ 1.0，内部可见输入几乎每次
+都塌到 6。这不是真实缓存率，而是把“本轮新增的尾巴”错误地算成了已缓存内容。
 
 修复方式见第 5 节：最后一个 block 不作为本轮 cache creation/coverage 上限，
 但如果已经存在完全相同 fingerprint，则可以作为真实 cache read；请求成功后也
 仍会写入本地 tracker。修复后，只有当缓存真的吃掉了几乎全部输入（例如完全
-重复的请求）时才会命中 floor；常规带新问题的多轮请求，尾巴会作为真实未缓存
-input_tokens 体现，远高于 6。
+重复的请求）时才会命中 floor；常规带新问题的多轮请求，尾巴不会被计入本轮
+cache coverage。
 
 9. 典型行为预期
 

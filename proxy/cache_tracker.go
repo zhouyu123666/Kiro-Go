@@ -592,6 +592,26 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 	return result
 }
 
+func buildClaudeBillableUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	result := map[string]interface{}{
+		"input_tokens":  inputTokens,
+		"output_tokens": outputTokens,
+	}
+	if !includeCache {
+		return result
+	}
+	result["cache_creation_input_tokens"] = maxInt(usage.CacheCreationInputTokens, 0)
+	result["cache_read_input_tokens"] = maxInt(usage.CacheReadInputTokens, 0)
+	result["cache_creation"] = map[string]int{
+		"ephemeral_5m_input_tokens": maxInt(usage.CacheCreation5mInputTokens, 0),
+		"ephemeral_1h_input_tokens": maxInt(usage.CacheCreation1hInputTokens, 0),
+	}
+	return result
+}
+
 func claudeUsageBreakdown(totalInputTokens int, usage promptCacheUsage, includeCache bool) (int, promptCacheUsage) {
 	if totalInputTokens < 0 {
 		totalInputTokens = 0

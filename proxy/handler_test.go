@@ -147,7 +147,7 @@ func TestRecordSuccessLogUsesBillableInputForDisplayedBreakdown(t *testing.T) {
 	}
 }
 
-func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
+func TestClaudeMessagesReportsBillableInputTokens(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -200,6 +200,10 @@ func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
 	if !ok {
 		wantInputTokens = estimateClaudeRequestInputTokens(&claudeReq)
 	}
+	wantBillingInputTokens, ok := estimateClaudeRequestTikTokenInputTokens(&claudeReq)
+	if !ok {
+		wantBillingInputTokens = estimateClaudeRequestInputTokens(&claudeReq)
+	}
 	kiroPayloadInputTokens := estimateKiroPayloadInputTokens(ClaudeToKiro(&claudeReq, false))
 	if kiroPayloadInputTokens <= wantInputTokens {
 		t.Fatalf("test fixture must distinguish client estimate from Kiro payload estimate: client=%d kiro=%d", wantInputTokens, kiroPayloadInputTokens)
@@ -224,9 +228,80 @@ func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	expectedOutputTokens := estimateClaudeOutputTokens("ok", "", nil)
-	wantReportedInputTokens := finalizeClaudeUsageInputTokens(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model)
+	wantReportedInputTokens := finalizeKiroInputTokens(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantBillingInputTokens, claudeReq.Model)
 	if resp.Usage.InputTokens != wantReportedInputTokens {
-		t.Fatalf("expected public input tokens %d from request estimate, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
+		t.Fatalf("expected billable input tokens %d, got %d (request estimate %d, billing estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, wantBillingInputTokens, kiroPayloadInputTokens)
+	}
+}
+
+func TestClaudeMessagesPrefersUpstreamBillableInputOverContextUsage(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	if err := config.AddAccount(config.Account{
+		ID:          "acct",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "ok",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{
+			"inputTokens":  16,
+			"outputTokens": 41,
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{
+			"contextUsagePercentage": 50.0,
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-haiku-4.5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`)))
+	h.handleClaudeMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected request to succeed, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Usage.InputTokens != 16 || resp.Usage.OutputTokens != 41 {
+		t.Fatalf("expected response usage 16/41 from upstream metering, got %+v", resp.Usage)
 	}
 }
 

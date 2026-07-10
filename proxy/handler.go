@@ -986,7 +986,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
-	startInputTokens := finalizeClaudeUsageInputTokens(0, 0, 0, usageReportWindow, estimatedInputTokens, model)
+	startInputTokens := finalizeKiroInputTokens(0, 0, 0, usageReportWindow, billingInputTokens, model)
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
@@ -1006,7 +1006,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				"model":         model,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				"usage":         buildClaudeBillableUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
 			},
 		})
 		messageStarted = true
@@ -1407,7 +1407,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, requestLogTokenUsage{
 			TotalTokens:              inputTokens + outputTokens,
-			InputTokens:              visibleInputTokens,
+			InputTokens:              inputTokens,
 			CacheCreationInputTokens: publicCacheUsage.CacheCreationInputTokens,
 			CacheReadInputTokens:     publicCacheUsage.CacheReadInputTokens,
 			OutputTokens:             outputTokens,
@@ -1427,7 +1427,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(publicInputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeBillableUsageMap(inputTokens, outputTokens, publicCacheUsage, cacheProfile != nil),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1707,7 +1707,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, requestLogTokenUsage{
 			TotalTokens:              inputTokens + outputTokens,
-			InputTokens:              visibleInputTokens,
+			InputTokens:              inputTokens,
 			CacheCreationInputTokens: publicCacheUsage.CacheCreationInputTokens,
 			CacheReadInputTokens:     publicCacheUsage.CacheReadInputTokens,
 			OutputTokens:             outputTokens,
@@ -1732,13 +1732,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, publicInputTokens, outputTokens, model)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
 		if emittedOnlyThinking {
 			resp.StopReason = "max_tokens"
 		}
 		logger.Debugf("[ClaudeUsage] nonstream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
 			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
-		resp.Usage.InputTokens = visibleInputTokens
+		resp.Usage.InputTokens = inputTokens
 		resp.Usage.CacheCreationInputTokens = publicCacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = publicCacheUsage.CacheReadInputTokens
 		if cacheProfile != nil {
