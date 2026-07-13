@@ -10,9 +10,9 @@ const (
 	claudeTokenCorrectionFactor        = 1.10
 	claudeBillingTokenCorrectionFactor = 1.86
 	// Kiro's contextUsagePercentage includes a backend-owned default system
-	// prompt that is not part of the client's visible request. Exclude that
-	// fixed overhead only from the public Claude usage derived from context
-	// occupancy; billing and context-limit accounting must keep the full value.
+	// prompt that is not part of the client's visible first request. Exclude
+	// that fixed overhead only from first-turn public Claude usage derived from
+	// context occupancy; later turns, billing, and context limits keep it.
 	kiroDefaultSystemPromptTokens = 4096
 )
 
@@ -355,20 +355,22 @@ func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsage
 }
 
 func finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
+	return finalizeClaudeUsageInputTokensForTurn(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model, false)
+}
+
+func finalizeClaudeUsageInputTokensForTurn(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string, firstConversationTurn bool) int {
 	inputTokens := 0
 	if contextUsagePercentage > 0 {
-		inputTokens = publicInputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		if firstConversationTurn {
+			inputTokens = maxInt(inputTokens-kiroDefaultSystemPromptTokens, 0)
+		}
 	} else if upstreamInputTokens > 0 {
 		inputTokens = upstreamInputTokens
 	} else if estimatedInputTokens > 0 {
 		inputTokens = estimatedInputTokens
 	}
 	return capInputTokensToContextWindow(inputTokens, model)
-}
-
-func publicInputTokensFromContextUsagePercentage(percentage float64, reportWindow, outputTokens int) int {
-	inputTokens := inputTokensFromContextUsagePercentage(percentage, reportWindow, outputTokens)
-	return maxInt(inputTokens-kiroDefaultSystemPromptTokens, 0)
 }
 
 func finalizeKiroReportedInputTokens(inputTokens int, model string) int {

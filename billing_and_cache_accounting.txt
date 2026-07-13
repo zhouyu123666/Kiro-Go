@@ -31,20 +31,22 @@ Claude 兼容接口在生成公开 usage 时，会按下面顺序确定 public t
 
 得到 public total input 后，还会再经过模型上下文窗口限制的 clamp。
 
-如果走的是 contextUsagePercentage 路径，当前公式是：
+如果走的是 contextUsagePercentage 路径，首轮和后续轮次分别为：
 
-  public_total_input =
+  first_turn_public_total_input =
       max(round(context_window * contextUsagePercentage / 100)
           - output_tokens
           - 4096,
           0)
 
+  later_turn_public_total_input =
+      round(context_window * contextUsagePercentage / 100) - output_tokens
+
 这里的 output_tokens 指同一次响应最终算出来的输出 token。
 
-其中 4096 是 Kiro 后端默认 system prompt 的近似固定开销。它会出现在
-contextUsagePercentage 表示的上下文占用中，但并不是客户端本次提交的可见输入，
-因此只在公开 usage 的 context 推导路径中扣除。上游计费和上下文限制仍使用完整
-上下文占用值，不做这项扣减。
+其中 4096 是 Kiro 后端默认 system prompt 的近似固定开销。它只在 Claude 会话
+首轮（请求中仅有第一条 user message）的公开 usage 中扣除；同一会话的后续请求
+不再扣除。上游计费和上下文限制始终使用完整上下文占用值，不做这项扣减。
 
 也就是说，public_total_input 是“输入侧的总量”，不包含输出 token。
 

@@ -42,7 +42,7 @@ func TestFinalizeClaudeUsageInputTokensPrefersUpstreamUsageOverEstimate(t *testi
 
 func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamAndEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	want := publicInputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
 	if got != want {
 		t.Fatalf("expected context-derived input tokens %d to win, got %d", want, got)
 	}
@@ -50,7 +50,7 @@ func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamAndEstimat
 
 func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 0, "claude-sonnet-4.5")
-	want := publicInputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
 	if got != want {
 		t.Fatalf("expected context-derived fallback input tokens %d, got %d", want, got)
 	}
@@ -58,17 +58,25 @@ func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T)
 
 func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	want := publicInputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
 	if got != want {
 		t.Fatalf("expected context-derived input tokens %d to win over request estimate, got %d", want, got)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensExcludesKiroDefaultSystemPrompt(t *testing.T) {
-	got := finalizeClaudeUsageInputTokens(0, 42, 2.2, maxKiroInputTokens, 2, "claude-haiku-4.5")
+func TestFinalizeClaudeUsageInputTokensExcludesKiroDefaultSystemPromptOnFirstTurn(t *testing.T) {
+	got := finalizeClaudeUsageInputTokensForTurn(0, 42, 2.2, maxKiroInputTokens, 2, "claude-haiku-4.5", true)
 	want := 262 // round(200000 * 2.2%) - 42 output - 4096 Kiro system prompt
 	if got != want {
 		t.Fatalf("expected public input tokens %d after removing Kiro system prompt, got %d", want, got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensKeepsSystemPromptAfterFirstTurn(t *testing.T) {
+	got := finalizeClaudeUsageInputTokensForTurn(0, 42, 2.2, maxKiroInputTokens, 2, "claude-haiku-4.5", false)
+	want := 4358 // round(200000 * 2.2%) - 42 output, with no later-turn deduction
+	if got != want {
+		t.Fatalf("expected later turn to keep the full context-derived input %d, got %d", want, got)
 	}
 }
 

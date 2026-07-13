@@ -43,6 +43,24 @@ func TestRecordSuccessLogStoresTokenBreakdown(t *testing.T) {
 	}
 }
 
+func TestIsFirstClaudeConversationTurn(t *testing.T) {
+	if !isFirstClaudeConversationTurn(&ClaudeRequest{
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}) {
+		t.Fatalf("single initial user message should be treated as the first turn")
+	}
+
+	if isFirstClaudeConversationTurn(&ClaudeRequest{
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", Content: "hello"},
+			{Role: "user", Content: "follow up"},
+		},
+	}) {
+		t.Fatalf("request with conversation history must not be treated as the first turn")
+	}
+}
+
 func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	mustInitConfig(t)
 	now := time.Now().Unix()
@@ -191,7 +209,7 @@ func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	expectedOutputTokens := estimateClaudeOutputTokens("ok", "", nil)
-	wantReportedInputTokens := finalizeClaudeUsageInputTokens(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model)
+	wantReportedInputTokens := finalizeClaudeUsageInputTokensForTurn(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model, true)
 	if resp.Usage.InputTokens != wantReportedInputTokens {
 		t.Fatalf("expected public input tokens %d from request estimate, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
 	}
@@ -270,7 +288,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, 1, nil, "", maxKiroInputTokens, false)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -351,7 +369,7 @@ func TestClaudeNonStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testin
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens, false)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())
@@ -432,7 +450,7 @@ func TestClaudeStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testing.T
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens, false)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())

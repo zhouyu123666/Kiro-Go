@@ -946,15 +946,20 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 			req.Model, cacheProfile.TotalInputTokens, billingInputTokens, len(cacheProfile.Breakpoints), lastTokens)
 	}
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
+	firstConversationTurn := isFirstClaudeConversationTurn(effectiveReq)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow, firstConversationTurn)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow, firstConversationTurn)
 	}
 }
 
+func isFirstClaudeConversationTurn(req *ClaudeRequest) bool {
+	return req != nil && len(req.Messages) == 1 && strings.EqualFold(strings.TrimSpace(req.Messages[0].Role), "user")
+}
+
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int, firstConversationTurn bool) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1379,11 +1384,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(" ")
 		}
 		upstreamInputTokens := inputTokens
-		publicInputTokens := finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		publicInputTokens := finalizeClaudeUsageInputTokensForTurn(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model, firstConversationTurn)
 		inputTokens = finalizeKiroInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, billingInputTokens, model)
 		visibleInputTokens, publicCacheUsage := claudeUsageBreakdown(publicInputTokens, cacheUsage, cacheProfile != nil)
-		logger.Debugf("[ClaudeUsage] stream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
-			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
+		logger.Debugf("[ClaudeUsage] stream_final model=%s namespace=%q first_turn=%t public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
+			model, cacheNamespace, firstConversationTurn, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1585,7 +1590,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int, firstConversationTurn bool) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1665,7 +1670,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			outputTokens += estimateApproxTokens(" ")
 		}
 		upstreamInputTokens := inputTokens
-		publicInputTokens := finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model)
+		publicInputTokens := finalizeClaudeUsageInputTokensForTurn(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, estimatedInputTokens, model, firstConversationTurn)
 		inputTokens = finalizeKiroInputTokens(upstreamInputTokens, outputTokens, contextUsagePercentage, usageReportWindow, billingInputTokens, model)
 		visibleInputTokens, publicCacheUsage := claudeUsageBreakdown(publicInputTokens, cacheUsage, cacheProfile != nil)
 
@@ -1699,8 +1704,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if emittedOnlyThinking {
 			resp.StopReason = "max_tokens"
 		}
-		logger.Debugf("[ClaudeUsage] nonstream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
-			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
+		logger.Debugf("[ClaudeUsage] nonstream_final model=%s namespace=%q first_turn=%t public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
+			model, cacheNamespace, firstConversationTurn, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
 		resp.Usage.InputTokens = visibleInputTokens
 		resp.Usage.CacheCreationInputTokens = publicCacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = publicCacheUsage.CacheReadInputTokens
