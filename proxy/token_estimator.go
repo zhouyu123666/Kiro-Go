@@ -9,6 +9,11 @@ import (
 const (
 	claudeTokenCorrectionFactor        = 1.10
 	claudeBillingTokenCorrectionFactor = 1.86
+	// Kiro's contextUsagePercentage includes a backend-owned default system
+	// prompt that is not part of the client's visible request. Exclude that
+	// fixed overhead only from the public Claude usage derived from context
+	// occupancy; billing and context-limit accounting must keep the full value.
+	kiroDefaultSystemPromptTokens = 4096
 )
 
 // Binary media (images, documents) is sent to the model as attachments, not as
@@ -352,13 +357,18 @@ func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsage
 func finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
 	inputTokens := 0
 	if contextUsagePercentage > 0 {
-		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		inputTokens = publicInputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
 	} else if upstreamInputTokens > 0 {
 		inputTokens = upstreamInputTokens
 	} else if estimatedInputTokens > 0 {
 		inputTokens = estimatedInputTokens
 	}
 	return capInputTokensToContextWindow(inputTokens, model)
+}
+
+func publicInputTokensFromContextUsagePercentage(percentage float64, reportWindow, outputTokens int) int {
+	inputTokens := inputTokensFromContextUsagePercentage(percentage, reportWindow, outputTokens)
+	return maxInt(inputTokens-kiroDefaultSystemPromptTokens, 0)
 }
 
 func finalizeKiroReportedInputTokens(inputTokens int, model string) int {
