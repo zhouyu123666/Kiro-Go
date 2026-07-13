@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestFinalizeKiroInputTokensFallsBackToUpstreamInput(t *testing.T) {
 	got := finalizeKiroInputTokens(4397, 100, 50, maxKiroInputTokens, 0, "claude-sonnet-4.5")
@@ -42,15 +45,15 @@ func TestFinalizeClaudeUsageInputTokensPrefersUpstreamUsageOverEstimate(t *testi
 
 func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamAndEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	want := maxInt(inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)-kiroDefaultSystemPromptTokens, 0)
+	want := calibratedClaudeInputTokensFromContextUsage(5, maxKiroInputTokens, 100)
 	if got != want {
-		t.Fatalf("expected context-derived input tokens %d to win, got %d", want, got)
+		t.Fatalf("expected calibrated context-derived input tokens %d to win, got %d", want, got)
 	}
 }
 
 func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 0, "claude-sonnet-4.5")
-	want := maxInt(inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)-kiroDefaultSystemPromptTokens, 0)
+	want := calibratedClaudeInputTokensFromContextUsage(5, maxKiroInputTokens, 100)
 	if got != want {
 		t.Fatalf("expected context-derived fallback input tokens %d, got %d", want, got)
 	}
@@ -58,15 +61,15 @@ func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T)
 
 func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	want := maxInt(inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)-kiroDefaultSystemPromptTokens, 0)
+	want := calibratedClaudeInputTokensFromContextUsage(5, maxKiroInputTokens, 100)
 	if got != want {
-		t.Fatalf("expected context-derived input tokens %d to win over request estimate, got %d", want, got)
+		t.Fatalf("expected calibrated context-derived input tokens %d to win over request estimate, got %d", want, got)
 	}
 }
 
 func TestFinalizeClaudeUsageInputTokensExcludesKiroDefaultSystemPrompt(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 42, 2.2, maxKiroInputTokens, 2, "claude-haiku-4.5")
-	want := 262 // round(200000 * 2.2%) - 42 output - 4096 Kiro system prompt
+	want := calibratedClaudeInputTokensFromContextUsage(2.2, maxKiroInputTokens, 42)
 	if got != want {
 		t.Fatalf("expected public input tokens %d after removing Kiro system prompt, got %d", want, got)
 	}
@@ -76,6 +79,27 @@ func TestFinalizeClaudeUsageInputTokensUsesRawEstimateWithoutBillingMultiplier(t
 	got := finalizeClaudeUsageInputTokens(0, 100, 0, maxKiroInputTokens, 1100, "claude-sonnet-4.5")
 	if got != 1100 {
 		t.Fatalf("expected raw request estimate 1100, got %d", got)
+	}
+}
+
+func TestFinalizeClaudeUsageInputTokensMatchesR8BaselineTiers(t *testing.T) {
+	cases := []struct {
+		contextInput int
+		baseline     int
+	}{
+		{6724, 8},
+		{7271, 1005},
+		{12133, 9986},
+		{60774, 99813},
+		{277391, 499036},
+	}
+	for _, tc := range cases {
+		percentage := float64(tc.contextInput) / 10000 // 1M context window
+		got := finalizeClaudeUsageInputTokens(1, 0, percentage, 1_000_000, 1, "claude-opus-4.8")
+		delta := math.Abs(float64(got-tc.baseline)) / float64(tc.baseline)
+		if delta > 0.01 {
+			t.Fatalf("context input %d: got %d, baseline %d, delta %.2f%%", tc.contextInput, got, tc.baseline, delta*100)
+		}
 	}
 }
 
