@@ -82,11 +82,23 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	breakpoints := make([]promptCacheBreakpoint, 0)
 	cumulativeTokens := 0
 	var activeTTL time.Duration
+	lastBlockIndex := len(blocks) - 1
 
-	for _, block := range blocks {
+	for blockIndex, block := range blocks {
 		canonical := canonicalizeCacheValue(block.Value)
 		writeHashChunk(hasher, canonical)
 		cumulativeTokens += block.Tokens
+
+		// An explicit marker on the newest block prepares that prefix for the
+		// next turn; it does not mean the new tail was already cached for this
+		// request. Keep its TTL active so later turns can inherit it, but never
+		// count the current tail as a cache breakpoint.
+		if block.TTL > 0 {
+			activeTTL = block.TTL
+		}
+		if blockIndex == lastBlockIndex {
+			continue
+		}
 
 		// Determine whether this block acts as a cache breakpoint:
 		//   1) Explicit cache_control on the block itself.
@@ -96,7 +108,6 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		breakpointTTL := time.Duration(0)
 		if block.TTL > 0 {
 			breakpointTTL = block.TTL
-			activeTTL = block.TTL
 		} else if block.IsMessageEnd && activeTTL > 0 {
 			breakpointTTL = activeTTL
 		}

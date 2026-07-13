@@ -33,17 +33,18 @@ func TestFinalizeKiroInputTokensFallsBackToEstimate(t *testing.T) {
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersUpstreamUsageOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 0, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over upstream usage, got %d", got)
+	if got != 1234 {
+		t.Fatalf("expected upstream usage 1234 to win over request estimate, got %d", got)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverUpstreamAndContextUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverUpstreamAndEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(1234, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context-derived input tokens %d to win, got %d", want, got)
 	}
 }
 
@@ -55,10 +56,11 @@ func TestFinalizeClaudeUsageInputTokensFallsBackToContextUsageLast(t *testing.T)
 	}
 }
 
-func TestFinalizeClaudeUsageInputTokensPrefersEstimateOverContextUsage(t *testing.T) {
+func TestFinalizeClaudeUsageInputTokensPrefersContextUsageOverEstimate(t *testing.T) {
 	got := finalizeClaudeUsageInputTokens(0, 100, 5, maxKiroInputTokens, 9999, "claude-sonnet-4.5")
-	if got != 9999 {
-		t.Fatalf("expected request estimate 9999 to win over context usage, got %d", got)
+	want := inputTokensFromContextUsagePercentage(5, maxKiroInputTokens, 100)
+	if got != want {
+		t.Fatalf("expected context-derived input tokens %d to win over request estimate, got %d", want, got)
 	}
 }
 
