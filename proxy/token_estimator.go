@@ -10,7 +10,7 @@ const (
 	claudeTokenCorrectionFactor        = 1.10
 	claudeBillingTokenCorrectionFactor = 1.86
 	// R8 calibration against work.tokencheap.io shows that Kiro context usage
-	// contains about 6.7k backend-owned tokens and that the remaining occupancy
+	// contains about 7k backend-owned tokens and that the remaining occupancy
 	// needs a tokenizer scale correction to match client-visible Claude tokens.
 	claudePublicContextUsageCorrectionFactor = 1.843
 	claudePublicContextUsageMinTokens        = 8
@@ -18,7 +18,7 @@ const (
 	// prompt that is not part of the client's visible request. Exclude that
 	// fixed overhead from public Claude usage derived from context occupancy on
 	// every turn; billing and context-limit accounting keep the full value.
-	kiroDefaultSystemPromptTokens = 6724
+	kiroDefaultSystemPromptTokens = 6970
 )
 
 // Binary media (images, documents) is sent to the model as attachments, not as
