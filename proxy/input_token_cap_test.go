@@ -87,13 +87,13 @@ func TestFinalizeClaudeUsageInputTokensMatchesR8BaselineTiers(t *testing.T) {
 		contextInput int
 		baseline     int
 	}{
-		// Context inputs reconstructed from the same-prompt R8 retest. These
-		// must remain within 1% of the work.tokencheap.io baseline.
-		{6734, 8},
-		{7740, 1005},
-		{16702, 9986},
-		{106538, 99813},
-		{505750, 499036},
+		// Context inputs reconstructed from the latest isolated aitokentest
+		// retest. These must remain within 1% of the work.tokencheap.io baseline.
+		{6733, 8},
+		{7518, 1005},
+		{12375, 9986},
+		{60799, 99813},
+		{277116, 499036},
 	}
 	for _, tc := range cases {
 		percentage := float64(tc.contextInput) / 10000 // 1M context window

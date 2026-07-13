@@ -9,16 +9,16 @@ import (
 const (
 	claudeTokenCorrectionFactor        = 1.10
 	claudeBillingTokenCorrectionFactor = 1.86
-	// Same-prompt R8 calibration against work.tokencheap.io shows that Kiro
-	// context usage contains about 6.7k backend-owned tokens. After removing
-	// that fixed envelope, the remaining occupancy already uses the same scale
-	// as client-visible Claude tokens; no proportional correction is needed.
-	claudePublicContextUsageMinTokens = 8
+	// R8 calibration against work.tokencheap.io shows that Kiro context usage
+	// contains about 7k backend-owned tokens and that the remaining occupancy
+	// needs a tokenizer scale correction to match client-visible Claude tokens.
+	claudePublicContextUsageCorrectionFactor = 1.843
+	claudePublicContextUsageMinTokens        = 8
 	// Kiro's contextUsagePercentage includes a backend-owned default system
 	// prompt that is not part of the client's visible request. Exclude that
 	// fixed overhead from public Claude usage derived from context occupancy on
 	// every turn; billing and context-limit accounting keep the full value.
-	kiroDefaultSystemPromptTokens = 6734
+	kiroDefaultSystemPromptTokens = 6970
 )
 
 // Binary media (images, documents) is sent to the model as attachments, not as
@@ -383,7 +383,8 @@ func calibratedClaudeInputTokensFromContextUsage(contextUsagePercentage float64,
 	if clientVisibleTokens <= 0 {
 		return claudePublicContextUsageMinTokens
 	}
-	return maxInt(clientVisibleTokens, claudePublicContextUsageMinTokens)
+	corrected := int(math.Round(float64(clientVisibleTokens) * claudePublicContextUsageCorrectionFactor))
+	return maxInt(corrected, claudePublicContextUsageMinTokens)
 }
 
 func finalizeKiroReportedInputTokens(inputTokens int, model string) int {

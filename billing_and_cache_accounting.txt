@@ -34,16 +34,15 @@ Claude 兼容接口在生成公开 usage 时，会按下面顺序确定 public t
 如果走的是 contextUsagePercentage 路径，所有轮次统一使用：
 
   turn_public_total_input =
-      max(round(context_window * contextUsagePercentage / 100)
-          - output_tokens
-          - 6734,
+      max(round((round(context_window * contextUsagePercentage / 100)
+                 - output_tokens
+                 - 6970) * 1.843),
           8)
 
 这里的 output_tokens 指同一次响应最终算出来的输出 token。
 
-其中 6734 是根据“同一 prompt” R8 分档数据校准的 Kiro 后端固定隐藏上下文
-开销。扣除该开销后，context usage 与客户端可见 Claude token 已是同一比例，
-不再做额外倍率缩放。隐藏开销会包含在每一轮的
+其中 6970 是根据 R8 分档数据校准的 Kiro 后端固定隐藏上下文开销，1.843
+是 context usage 口径到客户端可见 Claude token 口径的校正系数。隐藏开销会包含在每一轮的
 contextUsagePercentage 上下文占用中，因此所有轮次的公开 usage 都统一扣除一次。
 上游计费和上下文限制始终使用完整上下文占用值，不做这项扣减。
 
