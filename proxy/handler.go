@@ -21,19 +21,21 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time         int64   `json:"time"`         // Unix timestamp
-	Endpoint     string  `json:"endpoint"`     // claude/openai/responses
-	Model        string  `json:"model"`        // Requested model
-	AccountID    string  `json:"accountId"`    // Account used
-	Status       string  `json:"status"`       // "success" or "error"
-	Error        string  `json:"error"`        // Error message (empty on success)
-	ErrorType    string  `json:"errorType"`    // Error category (empty on success)
-	InputTokens  int     `json:"inputTokens"`  // Visible, uncached input tokens
-	CacheTokens  int     `json:"cacheTokens"`  // Cache read + cache creation tokens
-	OutputTokens int     `json:"outputTokens"` // Output tokens
-	Tokens       int     `json:"tokens"`       // Total tokens (input+cache+output)
-	Credits      float64 `json:"credits"`      // Credits consumed (0 on failure)
-	Duration     int64   `json:"duration"`     // Request duration in ms
+	Time             int64   `json:"time"`             // Unix timestamp
+	Endpoint         string  `json:"endpoint"`         // claude/openai/responses
+	Model            string  `json:"model"`            // Requested model
+	AccountID        string  `json:"accountId"`        // Account used
+	Status           string  `json:"status"`           // "success" or "error"
+	Error            string  `json:"error"`            // Error message (empty on success)
+	ErrorType        string  `json:"errorType"`        // Error category (empty on success)
+	InputTokens      int     `json:"inputTokens"`      // Visible, uncached input tokens
+	CacheTokens      int     `json:"cacheTokens"`      // Cache read + cache write tokens
+	CacheReadTokens  int     `json:"cacheReadTokens"`  // Tokens read from prompt cache
+	CacheWriteTokens int     `json:"cacheWriteTokens"` // Tokens written to prompt cache
+	OutputTokens     int     `json:"outputTokens"`     // Output tokens
+	Tokens           int     `json:"tokens"`           // Total tokens (input+cache+output)
+	Credits          float64 `json:"credits"`          // Credits consumed (0 on failure)
+	Duration         int64   `json:"duration"`         // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -1395,7 +1397,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, visibleInputTokens,
-			publicCacheUsage.CacheCreationInputTokens+publicCacheUsage.CacheReadInputTokens,
+			publicCacheUsage.CacheReadInputTokens, publicCacheUsage.CacheCreationInputTokens,
 			outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := "end_turn"
@@ -1523,26 +1525,30 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 }
 
 // recordSuccessLog records a successful request in the request logs. Tokens
-// use the public usage breakdown so total always equals input+cache+output.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, inputTokens, cacheTokens, outputTokens int, credits float64, durationMs int64) {
+// use the public usage breakdown so total always equals
+// input+cache_read+cache_write+output.
+func (h *Handler) recordSuccessLog(endpoint, model, accountID string, inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens int, credits float64, durationMs int64) {
+	cacheTokens := cacheReadTokens + cacheWriteTokens
 	totalTokens := inputTokens + cacheTokens + outputTokens
 	entry := RequestLog{
-		Time:         time.Now().Unix(),
-		Endpoint:     endpoint,
-		Model:        model,
-		AccountID:    accountID,
-		Status:       "success",
-		InputTokens:  inputTokens,
-		CacheTokens:  cacheTokens,
-		OutputTokens: outputTokens,
-		Tokens:       totalTokens,
-		Credits:      credits,
-		Duration:     durationMs,
+		Time:             time.Now().Unix(),
+		Endpoint:         endpoint,
+		Model:            model,
+		AccountID:        accountID,
+		Status:           "success",
+		InputTokens:      inputTokens,
+		CacheTokens:      cacheTokens,
+		CacheReadTokens:  cacheReadTokens,
+		CacheWriteTokens: cacheWriteTokens,
+		OutputTokens:     outputTokens,
+		Tokens:           totalTokens,
+		Credits:          credits,
+		Duration:         durationMs,
 	}
 
 	h.appendRequestLog(entry)
-	logger.Infof("[TokenUsage] endpoint=%s model=%s account=%s input=%d cache=%d output=%d total=%d",
-		endpoint, model, accountID, inputTokens, cacheTokens, outputTokens, totalTokens)
+	logger.Infof("[TokenUsage] endpoint=%s model=%s account=%s input=%d cache_read=%d cache_write=%d output=%d total=%d",
+		endpoint, model, accountID, inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, totalTokens)
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1679,7 +1685,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(cacheNamespace, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, visibleInputTokens,
-			publicCacheUsage.CacheCreationInputTokens+publicCacheUsage.CacheReadInputTokens,
+			publicCacheUsage.CacheReadInputTokens, publicCacheUsage.CacheCreationInputTokens,
 			outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
@@ -2135,7 +2141,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens, 0, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, inputTokens, 0, 0, outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2238,7 +2244,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens, 0, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, inputTokens, 0, 0, outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)

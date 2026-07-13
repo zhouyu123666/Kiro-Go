@@ -223,9 +223,10 @@ Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的�
 Kiro-Go 的运行日志和管理页请求日志会显示：
 
 - input：公开口径的未缓存输入
-- cache：cache_read + cache_creation
+- cache read：cache_read_input_tokens
+- cache write (5m)：cache_creation_input_tokens（默认 5 分钟 TTL）
 - output：输出 token
-- total：input + cache + output
+- total：input + cache read + cache write + output
 
 10. 本地验证建议
 

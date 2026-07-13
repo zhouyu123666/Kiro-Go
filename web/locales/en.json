@@ -479,6 +479,8 @@
   "logs.tokens": "Tokens",
   "logs.inputTokens": "Input Tokens",
   "logs.cacheTokens": "Cache Tokens",
+  "logs.cacheReadTokens": "Cache Read",
+  "logs.cacheWriteTokens": "Cache Write (5m)",
   "logs.outputTokens": "Output Tokens",
   "logs.totalTokens": "Total Tokens",
   "logs.duration": "Duration",
