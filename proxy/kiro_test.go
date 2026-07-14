@@ -13,37 +13,54 @@ import (
 	"time"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
-
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
+func TestParseEventStreamPreservesRepeatedDeltaCharacters(t *testing.T) {
+	tests := []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{
+			name:   "repeated chinese character",
+			chunks: []string{"合", "合", "信息"},
+			want:   "合合信息",
+		},
+		{
+			name:   "repeated chinese character at chunk boundary",
+			chunks: []string{"合", "合信息"},
+			want:   "合合信息",
+		},
+		{
+			name:   "repeated latin character across chunks",
+			chunks: []string{"deepse", "ek"},
+			want:   "deepseek",
+		},
 	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
-	}
-}
 
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var frames [][]byte
+			for _, chunk := range tt.chunks {
+				frames = append(frames, awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+					"content": chunk,
+				}))
+			}
 
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
-	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
-
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
-
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+			var got strings.Builder
+			err := parseEventStream(bytes.NewReader(bytes.Join(frames, nil)), &KiroStreamCallback{
+				OnText: func(text string, isThinking bool) {
+					if isThinking {
+						t.Fatalf("unexpected thinking text %q", text)
+					}
+					got.WriteString(text)
+				},
+			})
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("expected preserved repeated text %q, got %q", tt.want, got.String())
+			}
+		})
 	}
 }
 
