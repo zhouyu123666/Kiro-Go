@@ -26,6 +26,23 @@ func TestThinkingSourceReasoningFirst(t *testing.T) {
 	}
 }
 
+func TestRecordSuccessLogStoresTokenBreakdown(t *testing.T) {
+	h := &Handler{}
+	h.recordSuccessLog("claude", "claude-sonnet-4.5", "acct-1", 120, 700, 100, 40, 0, 25)
+
+	logs := h.getRequestLogs()
+	if len(logs) != 1 {
+		t.Fatalf("expected one request log, got %d", len(logs))
+	}
+	got := logs[0]
+	if got.InputTokens != 120 || got.CacheReadTokens != 700 || got.CacheWriteTokens != 100 || got.CacheTokens != 800 || got.OutputTokens != 40 {
+		t.Fatalf("unexpected token breakdown: %+v", got)
+	}
+	if got.Tokens != got.InputTokens+got.CacheReadTokens+got.CacheWriteTokens+got.OutputTokens {
+		t.Fatalf("total must equal input+cache read+cache write+output: %+v", got)
+	}
+}
+
 func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	mustInitConfig(t)
 	now := time.Now().Unix()

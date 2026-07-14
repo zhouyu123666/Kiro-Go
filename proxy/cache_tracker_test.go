@@ -266,6 +266,57 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	}
 }
 
+// TestPromptCacheExplicitCacheControlOnTailStaysVisible reproduces Claude
+// Code's habit of marking the newest message for caching on the next turn.
+// That new tail must remain visible input in the current turn, even though it
+// carries an explicit cache_control marker.
+func TestPromptCacheExplicitCacheControlOnTailStaysVisible(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	stableSystem := strings.Repeat("stable cacheable system instructions ", 320)
+	newTail := strings.Repeat("brand new user content that cannot already be cached ", 160)
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": stableSystem,
+				"cache_control": map[string]interface{}{
+					"type": "ephemeral",
+				},
+			},
+		},
+		Messages: []ClaudeMessage{{
+			Role: "user",
+			Content: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": newTail,
+					"cache_control": map[string]interface{}{
+						"type": "ephemeral",
+					},
+				},
+			},
+		}},
+	}
+
+	blocks := flattenClaudeCacheBlocks(req)
+	tailTokens := blocks[len(blocks)-1].Tokens
+	profile := tracker.BuildClaudeProfile(req, 1)
+	if profile == nil {
+		t.Fatalf("expected stable system prefix to build a cache profile")
+	}
+	lastBreakpointTokens := profile.Breakpoints[len(profile.Breakpoints)-1].CumulativeTokens
+	if lastBreakpointTokens >= profile.TotalInputTokens {
+		t.Fatalf("tail cache_control must not cover the entire current prompt: breakpoint=%d total=%d", lastBreakpointTokens, profile.TotalInputTokens)
+	}
+
+	cacheUsage := tracker.Compute("acct-1", profile)
+	visibleInputTokens, _ := claudeUsageBreakdown(profile.TotalInputTokens, cacheUsage, true)
+	if visibleInputTokens < tailTokens {
+		t.Fatalf("new explicit tail must stay visible instead of collapsing to floor %d: tail=%d visible=%d usage=%+v", claudeUsageEnvelopeMinTokens, tailTokens, visibleInputTokens, cacheUsage)
+	}
+}
+
 func TestPromptCacheSkipsDynamicSystemPreludeBeforeFirstExplicitCacheBlock(t *testing.T) {
 	tracker := newPromptCacheTracker(time.Hour)
 	stableSystem := strings.Repeat("stable cacheable instructions ", 320)

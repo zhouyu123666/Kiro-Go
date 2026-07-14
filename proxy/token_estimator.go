@@ -9,6 +9,16 @@ import (
 const (
 	claudeTokenCorrectionFactor        = 1.10
 	claudeBillingTokenCorrectionFactor = 1.86
+	// R8 calibration against work.tokencheap.io shows that Kiro context usage
+	// contains about 7k backend-owned tokens and that the remaining occupancy
+	// needs a tokenizer scale correction to match client-visible Claude tokens.
+	claudePublicContextUsageCorrectionFactor = 1.843
+	claudePublicContextUsageMinTokens        = 8
+	// Kiro's contextUsagePercentage includes a backend-owned default system
+	// prompt that is not part of the client's visible request. Exclude that
+	// fixed overhead from public Claude usage derived from context occupancy on
+	// every turn; billing and context-limit accounting keep the full value.
+	kiroDefaultSystemPromptTokens = 6970
 )
 
 // Binary media (images, documents) is sent to the model as attachments, not as
@@ -352,13 +362,29 @@ func finalizeKiroInputTokens(upstreamInputTokens, outputTokens int, contextUsage
 func finalizeClaudeUsageInputTokens(upstreamInputTokens, outputTokens int, contextUsagePercentage float64, usageReportWindow, estimatedInputTokens int, model string) int {
 	inputTokens := 0
 	if contextUsagePercentage > 0 {
-		inputTokens = inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+		inputTokens = calibratedClaudeInputTokensFromContextUsage(
+			contextUsagePercentage, usageReportWindow, outputTokens,
+		)
 	} else if upstreamInputTokens > 0 {
 		inputTokens = upstreamInputTokens
 	} else if estimatedInputTokens > 0 {
 		inputTokens = estimatedInputTokens
 	}
 	return capInputTokensToContextWindow(inputTokens, model)
+}
+
+func calibratedClaudeInputTokensFromContextUsage(contextUsagePercentage float64, usageReportWindow, outputTokens int) int {
+	contextInputTokens := inputTokensFromContextUsagePercentage(contextUsagePercentage, usageReportWindow, outputTokens)
+	if contextInputTokens <= 0 {
+		return 0
+	}
+
+	clientVisibleTokens := contextInputTokens - kiroDefaultSystemPromptTokens
+	if clientVisibleTokens <= 0 {
+		return claudePublicContextUsageMinTokens
+	}
+	corrected := int(math.Round(float64(clientVisibleTokens) * claudePublicContextUsageCorrectionFactor))
+	return maxInt(corrected, claudePublicContextUsageMinTokens)
 }
 
 func finalizeKiroReportedInputTokens(inputTokens int, model string) int {

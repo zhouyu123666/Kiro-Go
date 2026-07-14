@@ -744,7 +744,11 @@
       '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
-      '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.inputTokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.cacheReadTokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.cacheWriteTokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.outputTokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.totalTokens')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
@@ -766,7 +770,11 @@
         '<td>' + escapeHtml(l.endpoint) + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
-        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + (isErr ? '-' : formatNum(l.inputTokens || 0)) + '</td>' +
+        '<td>' + (isErr ? '-' : formatNum(l.cacheReadTokens || 0)) + '</td>' +
+        '<td>' + (isErr ? '-' : formatNum(l.cacheWriteTokens || 0)) + '</td>' +
+        '<td>' + (isErr ? '-' : formatNum(l.outputTokens || 0)) + '</td>' +
+        '<td>' + (isErr ? '-' : formatNum(l.tokens || 0)) + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';

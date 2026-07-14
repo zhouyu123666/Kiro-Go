@@ -31,11 +31,20 @@ Claude 兼容接口在生成公开 usage 时，会按下面顺序确定 public t
 
 得到 public total input 后，还会再经过模型上下文窗口限制的 clamp。
 
-如果走的是 contextUsagePercentage 路径，当前公式是：
+如果走的是 contextUsagePercentage 路径，所有轮次统一使用：
 
-  public_total_input = round(context_window * contextUsagePercentage / 100) - output_tokens
+  turn_public_total_input =
+      max(round((round(context_window * contextUsagePercentage / 100)
+                 - output_tokens
+                 - 6970) * 1.843),
+          8)
 
 这里的 output_tokens 指同一次响应最终算出来的输出 token。
+
+其中 6970 是根据 R8 分档数据校准的 Kiro 后端固定隐藏上下文开销，1.843
+是 context usage 口径到客户端可见 Claude token 口径的校正系数。隐藏开销会包含在每一轮的
+contextUsagePercentage 上下文占用中，因此所有轮次的公开 usage 都统一扣除一次。
+上游计费和上下文限制始终使用完整上下文占用值，不做这项扣减。
 
 也就是说，public_total_input 是“输入侧的总量”，不包含输出 token。
 
@@ -59,6 +68,14 @@ Kiro-Go 会基于以下内容构建 cache profile：
 
 - 显式 cache_control 断点
 - 在首次显式 cache_control 之后的 message-end 隐式断点
+
+无论是显式还是隐式，当前请求的最后一个 block 永远不会成为缓存断点。
+Claude Code 会在最新消息上放置显式 cache_control，用于为下一轮预热；
+这段最新尾巴在本轮仍是全新输入，不可能已经存在于缓存中。等下一轮有新消息
+追加后，它不再是最后一个 block，届时会自然成为可缓存前缀。
+
+最后一个 block 上的显式标记仍会更新 active TTL，只是不计入本轮 breakpoint，
+因此不会破坏后续轮次的 TTL 继承和 message-end 隐式断点。
 
 当前实现里的几个关键细节：
 - system 中第一个显式 cache_control 之前的动态前缀不会参与稳定缓存后缀
@@ -178,6 +195,11 @@ Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的�
 - 但对客户端和日志解释来说，完全为 0 往往不够直观
 - 因此保留一个很小的 envelope floor，更符合实际观感
 
+这个 floor 只应在缓存确实覆盖了几乎全部输入时触发，例如完全重复请求。
+常规多轮请求里的最新问题属于未缓存尾巴，必须保留在 input_tokens 中；最新
+尾块上的显式 cache_control 不能把它提前划入缓存，也不能因此把 input_tokens
+错误压到 6。
+
 9. 典型行为预期
 
 同一大前缀、第一次请求：
@@ -193,7 +215,16 @@ Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的�
 稳定前缀 + 仅尾巴变化：
 
 - cache_read_input_tokens > 0
-- cache_creation_input_tokens > 0
+- input_tokens 包含本轮新增尾巴，通常明显高于 6
+- cache_creation_input_tokens 只计算最后一个 block 之前尚未命中的可缓存前缀
+
+Kiro-Go 的运行日志和管理页请求日志会显示：
+
+- input：公开口径的未缓存输入
+- cache read：cache_read_input_tokens
+- cache write (5m)：cache_creation_input_tokens（默认 5 分钟 TTL）
+- output：输出 token
+- total：input + cache read + cache write + output
 
 10. 本地验证建议
 
@@ -216,7 +247,7 @@ Kiro-Go 不会再把 usage.input_tokens 压到 0，而是保留一个很小的�
 
 1. creation
 2. read
-3. read + 小 creation
+3. read + 可见的未缓存尾巴（若中间还有新前缀，也可能有小 creation）
 
 11. 当前设计取舍
 
