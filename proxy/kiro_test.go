@@ -21,13 +21,13 @@ func TestParseEventStreamPreservesRepeatedDeltaCharacters(t *testing.T) {
 	}{
 		{
 			name:   "repeated chinese character",
-			chunks: []string{"合", "合", "信息"},
-			want:   "合合信息",
+			chunks: []string{"谢", "谢", "配合"},
+			want:   "谢谢配合",
 		},
 		{
 			name:   "repeated chinese character at chunk boundary",
-			chunks: []string{"合", "合信息"},
-			want:   "合合信息",
+			chunks: []string{"谢", "谢配合"},
+			want:   "谢谢配合",
 		},
 		{
 			name:   "repeated latin character across chunks",
