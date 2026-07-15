@@ -551,6 +551,12 @@ func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
 		buildModelInfo("claude-sonnet-5", "anthropic", true),
 		buildModelInfo("claude-sonnet-5"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("gpt-5.6-sol", "anthropic", true),
+		buildModelInfo("gpt-5.6-sol"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("gpt-5.6-terra", "anthropic", true),
+		buildModelInfo("gpt-5.6-terra"+thinkingSuffix, "anthropic", true),
+		buildModelInfo("gpt-5.6-luna", "anthropic", true),
+		buildModelInfo("gpt-5.6-luna"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
 		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
 		buildModelInfo("claude-opus-4.6", "anthropic", true),
