@@ -114,7 +114,8 @@ func TestAdminAccountsUsageReturnsQuotaSummary(t *testing.T) {
 	}
 }
 
-func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
+func TestClaudeMessagesReportsContextUsageDerivedPublicInputTokens(t *testing.T) {
+	dbPath := withTempContextDebugDB(t)
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -193,7 +194,114 @@ func TestClaudeMessagesReportsRequestEstimatePublicInputTokens(t *testing.T) {
 	expectedOutputTokens := estimateClaudeOutputTokens("ok", "", nil)
 	wantReportedInputTokens := finalizeClaudeUsageInputTokens(0, expectedOutputTokens, 50.0, getClaudeCodeUsageReportWindow(claudeReq.Model), wantInputTokens, claudeReq.Model)
 	if resp.Usage.InputTokens != wantReportedInputTokens {
-		t.Fatalf("expected public input tokens %d from request estimate, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
+		t.Fatalf("expected public input tokens %d from context usage, got %d (request estimate %d, kiro payload estimate %d)", wantReportedInputTokens, resp.Usage.InputTokens, wantInputTokens, kiroPayloadInputTokens)
+	}
+	if got := sqliteCount(t, dbPath, "content_data LIKE '%claude_context_debug_initial%'"); got == 0 {
+		t.Fatalf("expected initial context debug rows")
+	}
+	if got := sqliteCount(t, dbPath, "content_data LIKE '%claude_context_debug_final%' AND content_data LIKE '%context_usage_percentage%'"); got == 0 {
+		t.Fatalf("expected final context debug usage row")
+	}
+	if got := sqliteCount(t, dbPath, "content_data LIKE '%kiro_current_message%'"); got == 0 {
+		t.Fatalf("expected expanded Kiro current message rows")
+	}
+}
+
+func TestClaudeStreamWritesContextDebugRows(t *testing.T) {
+	dbPath := withTempContextDebugDB(t)
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "acct-stream",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct-stream",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ok"}))
+		_, _ = w.Write(awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 3.0}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4.5","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	h.handleClaudeMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected stream request to succeed, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := sqliteCount(t, dbPath, "content_data LIKE '%claude_context_debug_final%' AND content_data LIKE '%stream%'"); got == 0 {
+		t.Fatalf("expected stream final context debug row")
+	}
+}
+
+func TestClaudeMessagesWritesContextDebugErrorRows(t *testing.T) {
+	dbPath := withTempContextDebugDB(t)
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "acct-error",
+		Enabled:     true,
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:profile/acct-error",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream failed", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4.5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`))
+	h.handleClaudeMessages(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected upstream failure status, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := sqliteCount(t, dbPath, "content_data LIKE '%claude_context_debug_final%' AND content_data LIKE '%upstream%'"); got == 0 {
+		t.Fatalf("expected error context debug final row")
 	}
 }
 
@@ -270,7 +378,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, 1, nil, nil, "", maxKiroInputTokens)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -351,7 +459,7 @@ func TestClaudeNonStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testin
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, nil, "", maxKiroInputTokens)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())
@@ -432,7 +540,7 @@ func TestClaudeStreamThinkingOnlyReturnsMaxTokensAndPlaceholderText(t *testing.T
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, "", maxKiroInputTokens)
+	h.handleClaudeStream(rec, payload, "claude-sonnet-4.5", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, 1, nil, nil, "", maxKiroInputTokens)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected success status, got %d body=%s", rec.Code, rec.Body.String())
