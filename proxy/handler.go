@@ -90,6 +90,21 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+// extractVisibleAndReasoning splits raw visible-channel content into answer text
+// and any embedded reasoning. When thinking already arrived via structured
+// reasoningContentEvent frames, a literal thinking tag in the visible content is
+// part of the answer (e.g. docs or code discussing the tag) rather than a
+// delimiter, so the content is preserved verbatim (only trimmed). Only for
+// tag-only upstreams — where no structured reasoning frame was seen — do we fall
+// back to the legacy inline-tag extraction. This prevents the visible answer from
+// being silently truncated at the first literal thinking tag.
+func extractVisibleAndReasoning(raw string, source thinkingStreamSource) (string, string) {
+	if source == thinkingSourceReasoningEvent {
+		return strings.TrimSpace(raw), ""
+	}
+	return extractThinkingFromContent(raw)
+}
+
 func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
@@ -1242,6 +1257,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				thinkingStarted = false
 			}
 
+			// When thinking arrived via structured reasoning frames, the visible
+			// channel is pure answer text; a literal thinking tag here is content,
+			// not a delimiter. Emit verbatim to avoid swallowing the answer.
+			if thinkingSource == thinkingSourceReasoningEvent {
+				sendText(text, 0)
+				return
+			}
+
 			textBuffer += text
 
 			for {
@@ -1427,7 +1450,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, extractedReasoning := extractVisibleAndReasoning(rawContentBuilder.String(), thinkingSource)
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
@@ -1777,7 +1800,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		thinkingFormat := thinkingOpts.Format
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		// If structured reasoning frames were received, a literal thinking tag in
+		// the visible content is answer text, not a delimiter — preserve verbatim.
+		nonStreamSource := thinkingSourceUnknown
+		if thinkingContent != "" {
+			nonStreamSource = thinkingSourceReasoningEvent
+		}
+		finalContent, extractedReasoning := extractVisibleAndReasoning(content, nonStreamSource)
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning
@@ -2126,6 +2155,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				thinkingStarted = false
 			}
 
+			// When thinking arrived via structured reasoning frames, the visible
+			// channel is pure answer text; a literal thinking tag here is content,
+			// not a delimiter. Emit verbatim to avoid swallowing the answer.
+			if thinkingSource == thinkingSourceReasoningEvent {
+				sendChunk(text, 0)
+				return
+			}
+
 			textBuffer += text
 
 			for {
@@ -2286,7 +2323,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, extractedReasoning := extractVisibleAndReasoning(rawContentBuilder.String(), thinkingSource)
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
 			reasoningOutput = extractedReasoning
@@ -2394,7 +2431,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		// If structured reasoning frames were received, a literal thinking tag in
+		// the visible content is answer text, not a delimiter — preserve verbatim.
+		nonStreamSource := thinkingSourceUnknown
+		if reasoningContent != "" {
+			nonStreamSource = thinkingSourceReasoningEvent
+		}
+		finalContent, extractedReasoning := extractVisibleAndReasoning(content, nonStreamSource)
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
 			reasoningContent = extractedReasoning
 		} else if !thinking {

@@ -26,6 +26,35 @@ func TestThinkingSourceReasoningFirst(t *testing.T) {
 	}
 }
 
+// TestExtractVisibleAndReasoningPreservesLiteralTagAfterReasoningEvent locks the
+// "断片儿" fix: once thinking arrived via a structured reasoningContentEvent, a
+// literal thinking tag inside the visible answer must be treated as content, not
+// a delimiter. Previously extractThinkingFromContent stripped everything from the
+// opening tag onward, blanking the turn.
+func TestExtractVisibleAndReasoningPreservesLiteralTagAfterReasoningEvent(t *testing.T) {
+	openTag := "<" + "thinking" + ">"
+	closeTag := "</" + "thinking" + ">"
+	raw := "here is how the " + openTag + " tag is parsed" + closeTag + " and the rest of the answer"
+
+	// Reasoning already came from a structured event: preserve verbatim.
+	visible, reasoning := extractVisibleAndReasoning(raw, thinkingSourceReasoningEvent)
+	if visible != strings.TrimSpace(raw) {
+		t.Fatalf("expected verbatim answer, got %q", visible)
+	}
+	if reasoning != "" {
+		t.Fatalf("expected no reasoning extracted, got %q", reasoning)
+	}
+
+	// Tag-only upstream (no reasoning event): legacy extraction still applies.
+	visibleLegacy, reasoningLegacy := extractVisibleAndReasoning(raw, thinkingSourceUnknown)
+	if strings.Contains(visibleLegacy, openTag) {
+		t.Fatalf("legacy path should strip the tag, got %q", visibleLegacy)
+	}
+	if reasoningLegacy == "" {
+		t.Fatalf("legacy path should extract reasoning from the tag block")
+	}
+}
+
 func TestRecordSuccessLogStoresTokenBreakdown(t *testing.T) {
 	h := &Handler{}
 	h.recordSuccessLog("claude", "claude-sonnet-4.5", "acct-1", 120, 700, 100, 40, 0, 25)
