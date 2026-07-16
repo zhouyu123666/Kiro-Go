@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"kiro-go/logger"
 	"math"
 	"strings"
 )
@@ -88,7 +89,16 @@ func totalTokensFromContextUsagePercentage(percentage float64, reportWindow int)
 func inputTokensFromContextUsagePercentage(percentage float64, reportWindow, outputTokens int) int {
 	totalTokens := totalTokensFromContextUsagePercentage(percentage, reportWindow)
 	if totalTokens <= 0 {
+		if contextDebugEnabled() {
+			logger.Infof("[ClaudeUsage] context_percentage_input percentage=%.4f report_window=%d total_tokens=%d output_tokens=%d input_tokens_before_cache=0",
+				percentage, reportWindow, totalTokens, outputTokens)
+		}
 		return 0
 	}
-	return maxInt(totalTokens-outputTokens, 0)
+	inputTokens := maxInt(totalTokens-outputTokens, 0)
+	if contextDebugEnabled() {
+		logger.Infof("[ClaudeUsage] context_percentage_input percentage=%.4f report_window=%d total_tokens=%d output_tokens=%d input_tokens_before_cache=%d formula=\"round(report_window*percentage/100)-output_tokens\"",
+			percentage, reportWindow, totalTokens, outputTokens, inputTokens)
+	}
+	return inputTokens
 }

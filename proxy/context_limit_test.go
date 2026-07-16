@@ -20,7 +20,17 @@ func TestMain(m *testing.M) {
 	if err := config.Init(filepath.Join(os.TempDir(), "kiro-context-limit-test-config.json")); err != nil {
 		panic("config.Init: " + err.Error())
 	}
-	os.Exit(m.Run())
+	oldContextDebugPath := contextDebugDBPath
+	contextDebugDir, err := os.MkdirTemp("", "kiro-context-debug-tests-*")
+	if err == nil {
+		contextDebugDBPath = filepath.Join(contextDebugDir, "context_debug.db")
+	}
+	code := m.Run()
+	contextDebugDBPath = oldContextDebugPath
+	if contextDebugDir != "" {
+		_ = os.RemoveAll(contextDebugDir)
+	}
+	os.Exit(code)
 }
 
 func oversizedInputText() string {

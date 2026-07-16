@@ -90,6 +90,21 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+// extractVisibleAndReasoning splits raw visible-channel content into answer text
+// and any embedded reasoning. When thinking already arrived via structured
+// reasoningContentEvent frames, a literal thinking tag in the visible content is
+// part of the answer (e.g. docs or code discussing the tag) rather than a
+// delimiter, so the content is preserved verbatim (only trimmed). Only for
+// tag-only upstreams — where no structured reasoning frame was seen — do we fall
+// back to the legacy inline-tag extraction. This prevents the visible answer from
+// being silently truncated at the first literal thinking tag.
+func extractVisibleAndReasoning(raw string, source thinkingStreamSource) (string, string) {
+	if source == thinkingSourceReasoningEvent {
+		return strings.TrimSpace(raw), ""
+	}
+	return extractThinkingFromContent(raw)
+}
+
 func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
@@ -872,6 +887,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	contextDebug := newContextDebugTask()
 	clientModel := rawReq.Model
 	gatewayEstimatedInputTokens := estimateClaudeCompactionInputTokens(&rawReq)
 	clientCompactionLimit := modelClientCompactionLimit(clientModel)
@@ -882,6 +898,24 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		msg := promptTooLongErrorMessage(gatewayEstimatedInputTokens, clientModel)
 		logger.Warnf("[ClaudeContextGate] rejecting prompt-too-long stage=raw model=%s gatewayInputTokens=%d clientLimit=%d message=%q",
 			clientModel, gatewayEstimatedInputTokens, clientCompactionLimit, msg)
+		appendClaudeContextDebugInitialRows(contextDebug, claudeContextDebugInitial{
+			RawBody:                body,
+			RawRequest:             &rawReq,
+			ClientModel:            clientModel,
+			Stream:                 rawReq.Stream,
+			UsageReportWindow:      getClaudeCodeUsageReportWindow(clientModel),
+			KiroPayloadInputTokens: gatewayEstimatedInputTokens,
+		})
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                 "preflight",
+			Model:                clientModel,
+			EstimatedInputTokens: gatewayEstimatedInputTokens,
+			Error:                msg,
+			Extra: map[string]interface{}{
+				"stage":        "raw_client_compaction_limit",
+				"client_limit": clientCompactionLimit,
+			},
+		}, "", "")
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 		return
 	}
@@ -935,34 +969,66 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	exceedsHardLimit := exceedsKiroInputTokenLimit(kiroPayloadInputTokens, req.Model)
 	logger.Debugf("[ClaudeContextGate] stage=kiroPayload model=%s actualModel=%s stream=%t estimatedInputTokens=%d hardLimit=%d exceedsHardLimit=%t history=%d currentContentChars=%d currentTools=%d currentToolResults=%d",
 		clientModel, req.Model, req.Stream, kiroPayloadInputTokens, modelHardInputTokenLimit(req.Model), exceedsHardLimit, len(kiroPayload.ConversationState.History), len(current.Content), currentTools, currentToolResults)
+	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, clientInputTokens)
+	lastTokens := 0
+	if cacheProfile != nil && len(cacheProfile.Breakpoints) > 0 {
+		lastTokens = cacheProfile.Breakpoints[len(cacheProfile.Breakpoints)-1].CumulativeTokens
+	}
+	appendClaudeContextDebugInitialRows(contextDebug, claudeContextDebugInitial{
+		RawBody:                body,
+		RawRequest:             &rawReq,
+		EffectiveRequest:       effectiveReq,
+		Payload:                kiroPayload,
+		ClientModel:            clientModel,
+		ActualModel:            req.Model,
+		Thinking:               thinking,
+		Stream:                 req.Stream,
+		KiroPayloadInputTokens: kiroPayloadInputTokens,
+		ClientInputTokens:      clientInputTokens,
+		BillingInputTokens:     billingInputTokens,
+		UsageReportWindow:      getClaudeCodeUsageReportWindow(req.Model),
+		CurrentTools:           currentTools,
+		CurrentToolResults:     currentToolResults,
+		CacheProfile:           cacheProfile,
+		PromptCacheProfileNil:  cacheProfile == nil,
+		PromptCacheBreakpoints: func() int {
+			if cacheProfile == nil {
+				return 0
+			}
+			return len(cacheProfile.Breakpoints)
+		}(),
+		PromptCacheLastTokens: lastTokens,
+	})
 	if exceedsHardLimit {
-		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", contextLimitErrorMessage(kiroPayloadInputTokens, req.Model))
+		msg := contextLimitErrorMessage(kiroPayloadInputTokens, req.Model)
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                 "preflight",
+			Model:                req.Model,
+			EstimatedInputTokens: clientInputTokens,
+			BillingInputTokens:   billingInputTokens,
+			BillableInputTokens:  kiroPayloadInputTokens,
+			Error:                msg,
+			Extra: map[string]interface{}{
+				"stage":      "kiro_payload_hard_limit",
+				"hard_limit": modelHardInputTokenLimit(req.Model),
+			},
+		}, "", "")
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 		return
 	}
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, clientInputTokens)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	if cacheProfile == nil {
-		logger.Debugf("[ClaudeUsage] cache_profile model=%s profile=nil client_input=%d billing_input=%d", req.Model, clientInputTokens, billingInputTokens)
-	} else {
-		lastTokens := 0
-		if len(cacheProfile.Breakpoints) > 0 {
-			lastTokens = cacheProfile.Breakpoints[len(cacheProfile.Breakpoints)-1].CumulativeTokens
-		}
-		logger.Debugf("[ClaudeUsage] cache_profile model=%s total_input=%d billing_input=%d breakpoints=%d last_breakpoint_tokens=%d",
-			req.Model, cacheProfile.TotalInputTokens, billingInputTokens, len(cacheProfile.Breakpoints), lastTokens)
-	}
 	usageReportWindow := getClaudeCodeUsageReportWindow(req.Model)
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, contextDebug, cacheProfile, apiKeyID, usageReportWindow)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, cacheProfile, apiKeyID, usageReportWindow)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, clientInputTokens, billingInputTokens, contextDebug, cacheProfile, apiKeyID, usageReportWindow)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, contextDebug *contextDebugTask, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1191,6 +1257,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				thinkingStarted = false
 			}
 
+			// When thinking arrived via structured reasoning frames, the visible
+			// channel is pure answer text; a literal thinking tag here is content,
+			// not a delimiter. Emit verbatim to avoid swallowing the answer.
+			if thinkingSource == thinkingSourceReasoningEvent {
+				sendText(text, 0)
+				return
+			}
+
 			textBuffer += text
 
 			for {
@@ -1345,6 +1419,24 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
+			appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+				Mode:                   "stream",
+				Model:                  model,
+				AccountID:              account.ID,
+				ContextUsagePercentage: contextUsagePercentage,
+				EstimatedInputTokens:   estimatedInputTokens,
+				BillingInputTokens:     billingInputTokens,
+				UpstreamInputTokens:    inputTokens,
+				OutputTokens:           outputTokens,
+				Credits:                credits,
+				CacheUsage:             cacheUsage,
+				ToolUses:               toolUses,
+				Error:                  err.Error(),
+				Extra: map[string]interface{}{
+					"stage":           "upstream_stream_after_message_start",
+					"message_started": true,
+				},
+			}, rawContentBuilder.String(), rawThinkingBuilder.String())
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1358,7 +1450,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, extractedReasoning := extractVisibleAndReasoning(rawContentBuilder.String(), thinkingSource)
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
 			thinkingOutput = extractedReasoning
@@ -1392,6 +1484,18 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		visibleInputTokens, publicCacheUsage := claudeUsageBreakdown(publicInputTokens, cacheUsage, cacheProfile != nil)
 		logger.Debugf("[ClaudeUsage] stream_final model=%s namespace=%q public_total=%d visible_input=%d billable_input=%d output=%d cache_creation=%d cache_read=%d context_pct=%.4f estimated_input=%d upstream_input=%d",
 			model, cacheNamespace, publicInputTokens, visibleInputTokens, inputTokens, outputTokens, publicCacheUsage.CacheCreationInputTokens, publicCacheUsage.CacheReadInputTokens, contextUsagePercentage, estimatedInputTokens, upstreamInputTokens)
+		messageUsage := map[string]interface{}{
+			"input_tokens":  visibleInputTokens,
+			"output_tokens": outputTokens,
+		}
+		if cacheProfile != nil {
+			messageUsage["cache_creation_input_tokens"] = publicCacheUsage.CacheCreationInputTokens
+			messageUsage["cache_read_input_tokens"] = publicCacheUsage.CacheReadInputTokens
+			messageUsage["cache_creation"] = map[string]int{
+				"ephemeral_5m_input_tokens": publicCacheUsage.CacheCreation5mInputTokens,
+				"ephemeral_1h_input_tokens": publicCacheUsage.CacheCreation1hInputTokens,
+			}
+		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1408,13 +1512,32 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			stopReason = "max_tokens"
 		}
 
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                   "stream",
+			Model:                  model,
+			AccountID:              account.ID,
+			ContextUsagePercentage: contextUsagePercentage,
+			EstimatedInputTokens:   estimatedInputTokens,
+			BillingInputTokens:     billingInputTokens,
+			UpstreamInputTokens:    upstreamInputTokens,
+			PublicInputTokens:      publicInputTokens,
+			VisibleInputTokens:     visibleInputTokens,
+			BillableInputTokens:    inputTokens,
+			OutputTokens:           outputTokens,
+			Credits:                credits,
+			CacheUsage:             cacheUsage,
+			PublicCacheUsage:       publicCacheUsage,
+			ToolUses:               toolUses,
+			Usage:                  messageUsage,
+		}, outputContent, thinkingOutput)
+
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(publicInputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": messageUsage,
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1424,11 +1547,31 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                 "stream",
+			Model:                model,
+			EstimatedInputTokens: estimatedInputTokens,
+			BillingInputTokens:   billingInputTokens,
+			Error:                "No available accounts",
+			Extra: map[string]interface{}{
+				"stage": "account_selection",
+			},
+		}, "", "")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
+	appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+		Mode:                 "stream",
+		Model:                model,
+		EstimatedInputTokens: estimatedInputTokens,
+		BillingInputTokens:   billingInputTokens,
+		Error:                lastErr.Error(),
+		Extra: map[string]interface{}{
+			"stage": "upstream_stream_before_message_start",
+		},
+	}, "", "")
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1597,7 +1740,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens, billingInputTokens int, contextDebug *contextDebugTask, cacheProfile *promptCacheProfile, apiKeyID string, usageReportWindow int) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1657,7 +1800,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		thinkingFormat := thinkingOpts.Format
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		// If structured reasoning frames were received, a literal thinking tag in
+		// the visible content is answer text, not a delimiter — preserve verbatim.
+		nonStreamSource := thinkingSourceUnknown
+		if thinkingContent != "" {
+			nonStreamSource = thinkingSourceReasoningEvent
+		}
+		finalContent, extractedReasoning := extractVisibleAndReasoning(content, nonStreamSource)
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning
@@ -1722,17 +1871,61 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				Ephemeral1hInputTokens: publicCacheUsage.CacheCreation1hInputTokens,
 			}
 		}
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                   "nonstream",
+			Model:                  model,
+			AccountID:              account.ID,
+			ContextUsagePercentage: contextUsagePercentage,
+			EstimatedInputTokens:   estimatedInputTokens,
+			BillingInputTokens:     billingInputTokens,
+			UpstreamInputTokens:    upstreamInputTokens,
+			PublicInputTokens:      publicInputTokens,
+			VisibleInputTokens:     visibleInputTokens,
+			BillableInputTokens:    inputTokens,
+			OutputTokens:           outputTokens,
+			Credits:                credits,
+			CacheUsage:             cacheUsage,
+			PublicCacheUsage:       publicCacheUsage,
+			ToolUses:               toolUses,
+			Usage: map[string]interface{}{
+				"input_tokens":                resp.Usage.InputTokens,
+				"output_tokens":               resp.Usage.OutputTokens,
+				"cache_creation_input_tokens": resp.Usage.CacheCreationInputTokens,
+				"cache_read_input_tokens":     resp.Usage.CacheReadInputTokens,
+				"cache_creation":              resp.Usage.CacheCreation,
+			},
+		}, finalContent, responseThinkingContent)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
 
 	if lastErr == nil {
+		appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+			Mode:                 "nonstream",
+			Model:                model,
+			EstimatedInputTokens: estimatedInputTokens,
+			BillingInputTokens:   billingInputTokens,
+			Error:                "No available accounts",
+			Extra: map[string]interface{}{
+				"stage": "account_selection",
+			},
+		}, "", "")
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
+	appendClaudeContextDebugFinalRows(contextDebug, claudeContextDebugFinal{
+		Mode:                 "nonstream",
+		Model:                model,
+		EstimatedInputTokens: estimatedInputTokens,
+		BillingInputTokens:   billingInputTokens,
+		Error:                lastErr.Error(),
+		Extra: map[string]interface{}{
+			"stage": "upstream_nonstream",
+		},
+	}, "", "")
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1962,6 +2155,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				thinkingStarted = false
 			}
 
+			// When thinking arrived via structured reasoning frames, the visible
+			// channel is pure answer text; a literal thinking tag here is content,
+			// not a delimiter. Emit verbatim to avoid swallowing the answer.
+			if thinkingSource == thinkingSourceReasoningEvent {
+				sendChunk(text, 0)
+				return
+			}
+
 			textBuffer += text
 
 			for {
@@ -2122,7 +2323,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent, extractedReasoning := extractVisibleAndReasoning(rawContentBuilder.String(), thinkingSource)
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
 			reasoningOutput = extractedReasoning
@@ -2230,7 +2431,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		// If structured reasoning frames were received, a literal thinking tag in
+		// the visible content is answer text, not a delimiter — preserve verbatim.
+		nonStreamSource := thinkingSourceUnknown
+		if reasoningContent != "" {
+			nonStreamSource = thinkingSourceReasoningEvent
+		}
+		finalContent, extractedReasoning := extractVisibleAndReasoning(content, nonStreamSource)
 		if thinking && reasoningContent == "" && extractedReasoning != "" {
 			reasoningContent = extractedReasoning
 		} else if !thinking {

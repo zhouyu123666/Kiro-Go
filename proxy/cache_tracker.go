@@ -571,12 +571,21 @@ func claudeUsageBreakdown(totalInputTokens int, usage promptCacheUsage, includeC
 		totalInputTokens = 0
 	}
 	if !includeCache {
+		if contextDebugEnabled() {
+			logger.Infof("[ClaudeUsage] usage_breakdown include_cache=false total_input=%d visible_input=%d cache_creation=0 cache_read=0",
+				totalInputTokens, totalInputTokens)
+		}
 		return totalInputTokens, promptCacheUsage{}
 	}
 
+	originalUsage := usage
 	usage = rebalancePromptCacheUsage(totalInputTokens, usage)
 	cachedInputTokens := usage.CacheReadInputTokens + usage.CacheCreationInputTokens
 	if cachedInputTokens <= 0 {
+		if contextDebugEnabled() {
+			logger.Infof("[ClaudeUsage] usage_breakdown include_cache=true total_input=%d visible_input=%d cache_creation=0 cache_read=0 raw_cache_creation=%d raw_cache_read=%d",
+				totalInputTokens, totalInputTokens, originalUsage.CacheCreationInputTokens, originalUsage.CacheReadInputTokens)
+		}
 		return totalInputTokens, usage
 	}
 	if cachedInputTokens > totalInputTokens {
@@ -584,6 +593,10 @@ func claudeUsageBreakdown(totalInputTokens int, usage promptCacheUsage, includeC
 	}
 	visibleInputTokens := totalInputTokens - cachedInputTokens
 	visibleInputTokens, usage = applyClaudeUsageEnvelopeFloor(totalInputTokens, visibleInputTokens, usage)
+	if contextDebugEnabled() {
+		logger.Infof("[ClaudeUsage] usage_breakdown include_cache=true total_input=%d visible_input=%d cache_creation=%d cache_read=%d cached_total=%d raw_cache_creation=%d raw_cache_read=%d formula=\"visible_input=total_input-cache_creation-cache_read\"",
+			totalInputTokens, visibleInputTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens, usage.CacheCreationInputTokens+usage.CacheReadInputTokens, originalUsage.CacheCreationInputTokens, originalUsage.CacheReadInputTokens)
+	}
 	return visibleInputTokens, usage
 }
 
