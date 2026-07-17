@@ -45,13 +45,50 @@ func TestExtractVisibleAndReasoningPreservesLiteralTagAfterReasoningEvent(t *tes
 		t.Fatalf("expected no reasoning extracted, got %q", reasoning)
 	}
 
-	// Tag-only upstream (no reasoning event): legacy extraction still applies.
+	// Tag-only upstream (no reasoning event): a tag that trails real answer text
+	// is NOT a leading block, so it must be preserved verbatim as content rather
+	// than stripped. This is the "leading + closing required" rule — stripping a
+	// mid-answer tag is exactly the "断片儿" corruption we fixed.
 	visibleLegacy, reasoningLegacy := extractVisibleAndReasoning(raw, thinkingSourceUnknown)
-	if strings.Contains(visibleLegacy, openTag) {
-		t.Fatalf("legacy path should strip the tag, got %q", visibleLegacy)
+	if visibleLegacy != strings.TrimSpace(raw) {
+		t.Fatalf("mid-answer tag must be preserved verbatim, got %q", visibleLegacy)
 	}
-	if reasoningLegacy == "" {
-		t.Fatalf("legacy path should extract reasoning from the tag block")
+	if reasoningLegacy != "" {
+		t.Fatalf("no reasoning should be extracted from a non-leading tag, got %q", reasoningLegacy)
+	}
+
+	// A genuine leading block (first non-whitespace, properly closed) is still
+	// extracted as reasoning, with the answer following it.
+	leading := "  " + openTag + "deliberating" + closeTag + "the visible answer"
+	visLead, reaLead := extractVisibleAndReasoning(leading, thinkingSourceUnknown)
+	if visLead != "the visible answer" {
+		t.Fatalf("leading block: expected answer only, got %q", visLead)
+	}
+	if reaLead != "deliberating" {
+		t.Fatalf("leading block: expected reasoning extracted, got %q", reaLead)
+	}
+
+	// A leading opening tag that never closes is not a real block: keep verbatim.
+	unclosed := openTag + "never closes, all answer"
+	visOpen, reaOpen := extractVisibleAndReasoning(unclosed, thinkingSourceUnknown)
+	if visOpen != strings.TrimSpace(unclosed) {
+		t.Fatalf("unclosed leading tag must be preserved, got %q", visOpen)
+	}
+	if reaOpen != "" {
+		t.Fatalf("unclosed leading tag should yield no reasoning, got %q", reaOpen)
+	}
+
+	// Closing-side (Image #3): a genuine leading block whose reasoning mentions a
+	// balanced literal <thinking>…</thinking> pair must extract the FULL reasoning
+	// up to the balancing close, not truncate at the first literal </thinking>.
+	innerReasoning := "consider the " + openTag + "literal" + closeTag + " tag, then decide"
+	balanced := openTag + innerReasoning + closeTag + "final answer"
+	visBal, reaBal := extractVisibleAndReasoning(balanced, thinkingSourceUnknown)
+	if reaBal != innerReasoning {
+		t.Fatalf("balanced literal pair must stay in reasoning\n got:  %q\n want: %q", reaBal, innerReasoning)
+	}
+	if visBal != "final answer" {
+		t.Fatalf("answer after balancing close must survive, got %q", visBal)
 	}
 }
 

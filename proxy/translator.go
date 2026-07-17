@@ -2934,30 +2934,32 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 }
 
 // extractThinkingFromContent 从内容中提取 <thinking> 标签内的内容
+// extractThinkingFromContent honors the "leading + closing required" rule: a
+// <thinking> block is recognized only when it is the first non-whitespace content
+// AND a matching </thinking> is present. This keeps a literal thinking tag that
+// merely appears inside the answer (docs, code, or an answer discussing the tag)
+// as answer content instead of a delimiter — the fix for the "断片儿" corruption
+// where the tail of such an answer was silently reclassified as reasoning.
 func extractThinkingFromContent(content string) (string, string) {
-	var reasoning string
-	result := content
-
-	for {
-		start := strings.Index(result, "<thinking>")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(result[start:], "</thinking>")
-		if end == -1 {
-			break
-		}
-		end += start
-
-		// 提取 thinking 内容
-		thinkingContent := result[start+10 : end]
-		reasoning += thinkingContent
-
-		// 从结果中移除 thinking 标签
-		result = result[:start] + result[end+11:]
+	trimmed := strings.TrimLeft(content, " \t\r\n")
+	if !strings.HasPrefix(trimmed, thinkingOpenTag) {
+		return strings.TrimSpace(content), ""
 	}
 
-	return strings.TrimSpace(result), reasoning
+	rest := trimmed[len(thinkingOpenTag):]
+	// Balanced close: nested/literal <thinking>…</thinking> pairs inside the
+	// reasoning cancel out, so a literal </thinking> mentioned mid-reasoning does
+	// not prematurely terminate the block (the Image #3 closing-side corruption).
+	end := findBalancedThinkingClose(rest)
+	if end == -1 {
+		// Opening tag never closes (or tags are unbalanced with surplus opens):
+		// not a real block, keep everything verbatim.
+		return strings.TrimSpace(content), ""
+	}
+
+	reasoning := rest[:end]
+	answer := rest[end+len(thinkingCloseTag):]
+	return strings.TrimSpace(answer), reasoning
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应

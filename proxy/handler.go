@@ -90,6 +90,149 @@ func allowTagSource(source *thinkingStreamSource) bool {
 	return *source == thinkingSourceTagBlock
 }
 
+const (
+	thinkingOpenTag  = "<thinking>"
+	thinkingCloseTag = "</thinking>"
+)
+
+// thinkingTagPhase tracks the parse state of the visible channel when thinking
+// arrives inline as a <thinking>...</thinking> block. The machine is monotonic:
+// it advances start -> thinking -> answer (or start -> answer) and never rewinds.
+// Once the answer phase begins, a literal thinking tag is answer content, never a
+// delimiter. This is what prevents the "断片儿" corruption where the second half of
+// an answer that merely mentions the tag was reclassified as reasoning.
+type thinkingTagPhase int
+
+const (
+	tagPhaseStart    thinkingTagPhase = iota // deciding: leading whitespace or a possible opening tag
+	tagPhaseThinking                         // inside a confirmed leading block, buffering until the close tag
+	tagPhaseAnswer                           // answer text; emit everything verbatim
+)
+
+// thinkingTagParser splits a streamed visible channel into at most one leading
+// thinking block plus the answer, enforcing the "leading + closing required"
+// rule: a <thinking> block is only honored when it is the first non-whitespace
+// content AND a matching </thinking> is seen. Everything else — a tag that trails
+// real answer text, or an opening tag that never closes — is answer content.
+//
+// send uses the shared (text, state) contract: state 0 = answer text, state 1 =
+// thinking open (+content), state 2 = thinking continuation, state 3 = thinking
+// close. Because a block must close to count, the parser buffers the whole block
+// and emits it in one shot as send(content,1)+send("",3); it never emits a
+// thinking delta it might later have to retract.
+type thinkingTagParser struct {
+	phase    thinkingTagPhase
+	buffer   string
+	allowTag func() bool // reports whether a recognized block should be emitted as thinking
+}
+
+// couldBeThinkingOpen reports whether trimmed is still a viable prefix of the
+// opening tag — i.e. more input could complete "<thinking>". Used to hold an
+// ambiguous partial tag (e.g. "<thi") across chunk boundaries without committing.
+func couldBeThinkingOpen(trimmed string) bool {
+	if len(trimmed) >= len(thinkingOpenTag) {
+		return false
+	}
+	return strings.HasPrefix(thinkingOpenTag, trimmed)
+}
+
+// findBalancedThinkingClose locates the </thinking> that actually terminates the
+// leading block, treating nested tags as balanced pairs. The caller has already
+// consumed the opening "<thinking>", so we start at depth 1: every further literal
+// "<thinking>" increments depth and every "</thinking>" decrements it. The block
+// ends at the close that brings depth back to 0. This is what lets reasoning prose
+// that *mentions* a balanced "<thinking>…</thinking>" pair (the Image #3 case) pass
+// through without the first literal "</thinking>" prematurely terminating the real
+// block. It returns the byte offset of the terminating close tag, or -1 if the
+// buffer does not yet contain a balancing close (need more input, or — on flush —
+// the tags were unbalanced with surplus opens). The two tokens never overlap
+// ("<thinking>" starts "<t", "</thinking>" starts "</"), so scanning for whichever
+// comes first is unambiguous.
+func findBalancedThinkingClose(s string) int {
+	depth := 1
+	i := 0
+	for i < len(s) {
+		closeRel := strings.Index(s[i:], thinkingCloseTag)
+		if closeRel == -1 {
+			return -1
+		}
+		openRel := strings.Index(s[i:], thinkingOpenTag)
+		if openRel != -1 && openRel < closeRel {
+			depth++
+			i += openRel + len(thinkingOpenTag)
+			continue
+		}
+		depth--
+		if depth == 0 {
+			return i + closeRel
+		}
+		i += closeRel + len(thinkingCloseTag)
+	}
+	return -1
+}
+
+// feed consumes a chunk of visible text and drives the state machine, calling
+// send for any resolved output. forceFlush is set on the final flush and at
+// tool-use boundaries: it forces a decision on any buffered-but-undecided text
+// rather than waiting for more input that will never arrive.
+func (p *thinkingTagParser) feed(text string, forceFlush bool, send func(string, int)) {
+	p.buffer += text
+
+	for {
+		switch p.phase {
+		case tagPhaseAnswer:
+			if p.buffer != "" {
+				send(p.buffer, 0)
+				p.buffer = ""
+			}
+			return
+
+		case tagPhaseStart:
+			trimmed := strings.TrimLeft(p.buffer, " \t\r\n")
+			if strings.HasPrefix(trimmed, thinkingOpenTag) {
+				// Confirmed leading block: discard leading whitespace and the
+				// opening tag, then look for the close in the thinking phase.
+				p.buffer = trimmed[len(thinkingOpenTag):]
+				p.phase = tagPhaseThinking
+				continue
+			}
+			if !forceFlush && couldBeThinkingOpen(trimmed) {
+				// Ambiguous partial tag (or nothing but whitespace): wait for more.
+				return
+			}
+			// Definitely not a leading tag: the answer has started.
+			p.phase = tagPhaseAnswer
+			continue
+
+		case tagPhaseThinking:
+			if end := findBalancedThinkingClose(p.buffer); end != -1 {
+				content := p.buffer[:end]
+				if p.allowTag == nil || p.allowTag() {
+					send(content, 1)
+					send("", 3)
+				}
+				p.buffer = p.buffer[end+len(thinkingCloseTag):]
+				p.phase = tagPhaseAnswer
+				continue
+			}
+			if forceFlush {
+				// The stream ended without a closing tag, so the leading
+				// "<thinking>" was never a real delimiter. Honor "closing
+				// required" by treating the whole thing as answer, tag included,
+				// rather than silently swallowing it as reasoning.
+				if p.buffer != "" {
+					send(thinkingOpenTag+p.buffer, 0)
+					p.buffer = ""
+				}
+				p.phase = tagPhaseAnswer
+				return
+			}
+			// Still open: keep buffering until the close tag arrives.
+			return
+		}
+	}
+}
+
 // extractVisibleAndReasoning splits raw visible-channel content into answer text
 // and any embedded reasoning. When thinking already arrived via structured
 // reasoningContentEvent frames, a literal thinking tag in the visible content is
@@ -1143,12 +1286,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			activeBlockType = blockType
 		}
 
-		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
+		tagParser := &thinkingTagParser{allowTag: func() bool { return allowTagSource(&thinkingSource) }}
 
 		sendText := func(text string, thinkingState int) {
 			if thinkingState == 0 {
@@ -1265,85 +1406,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				return
 			}
 
-			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendText(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendText(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendText(content, 1)
-								sendText("", 3)
-							} else {
-								sendText(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendText(textBuffer, 1)
-									sendText("", 3)
-								} else {
-									sendText(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendText(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendText(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
-				}
-			}
+			tagParser.feed(text, forceFlush, sendText)
 		}
 
 		callback := &KiroStreamCallback{
@@ -2024,13 +2087,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var contextUsagePercentage float64
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
-		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 		responseStarted := false
+		tagParser := &thinkingTagParser{allowTag: func() bool { return allowTagSource(&thinkingSource) }}
 
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
@@ -2163,85 +2224,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				return
 			}
 
-			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendChunk(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendChunk(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendChunk(content, 1)
-								sendChunk("", 3)
-							} else {
-								sendChunk(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendChunk(textBuffer, 1)
-									sendChunk("", 3)
-								} else {
-									sendChunk(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendChunk(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendChunk(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
-				}
-			}
+			tagParser.feed(text, forceFlush, sendChunk)
 		}
 
 		callback := &KiroStreamCallback{
